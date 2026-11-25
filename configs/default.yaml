@@ -1,0 +1,44 @@
+# EdgeGuard default configuration
+# See src/edgeguard/ for the implementation each section controls.
+
+attestation:
+  # ECDSA P-256 key paths (relative to project root)
+  # Generate with: python scripts/build_merkle.py --keygen
+  private_key_path: "keys/edgeguard_private.pem"
+  public_key_path:  "keys/edgeguard_public.pem"
+  # Saved attestation state (Merkle tree + signed root)
+  attestation_path: "attestation/model_attestation.json"
+
+detection:
+  # Path to calibration statistics (output of scripts/calibrate.py)
+  calibration_path: "configs/calibration.json"
+  # Anomaly score thresholds — tune with Calibrator.tune_thresholds()
+  zscore_threshold:   4.0     # Flag layer if max z-score exceeds this
+  mahal_threshold:   25.0     # Flag layer if Mahalanobis distance exceeds this
+  alpha:              0.5     # Mahalanobis weight in combined score
+  # Maximum covariance dimension — layers wider than this use z-score only
+  max_cov_dim:        512
+
+classifier:
+  # Fraction of model layers considered "early" for adversarial vs transient split
+  early_fraction: 0.4
+  # Rule preset: "default" | "strict" | "permissive"
+  rules_preset: "default"
+
+instrumentation:
+  # Backend: "pytorch_hooks" | "qnn_adapter"
+  backend: "pytorch_hooks"
+  # QNN-specific (ignored for pytorch_hooks backend)
+  qnn:
+    model_path: "models/model.so"
+    # Mapping: EdgeGuard layer name → QNN op node name(s)
+    # Example:
+    #   conv1: ["model/block0/Conv2d_0"]
+    #   fc:    ["model/head/MatMul_0"]
+    layer_op_map: {}
+    int8_clip: true
+
+logging:
+  level: "INFO"       # DEBUG | INFO | WARNING | ERROR
+  log_file: "logs/edgeguard.log"
+  log_to_console: true

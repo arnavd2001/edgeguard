@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "edgeguard"
+version = "0.1.0"
+description = "Layerwise intrusion detection and integrity attestation for quantized DNNs on edge accelerators"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "pyyaml>=6.0",
+    "cryptography>=41.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "torch>=2.1",          # for profiling / calibration only
+    "torchvision>=0.16",
+    "matplotlib>=3.7",
+    "tqdm>=4.66",
+]
+
+[project.scripts]
+edgeguard-calibrate  = "edgeguard.scripts.calibrate:main"
+edgeguard-build-tree = "edgeguard.scripts.build_merkle:main"
+edgeguard-evaluate   = "edgeguard.scripts.evaluate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = "-v --tb=short"
