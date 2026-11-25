@@ -204,3 +204,18 @@ class TestMonitorIntegration:
         z_new, m_new = monitor.tune_thresholds(clean_results, fpr_target=0.05)
         assert z_new > 0
         assert m_new > 0
+
+
+def test_streaming_covariance_matches_numpy():
+    """Regression: streaming covariance must equal the unbiased sample covariance."""
+    from edgeguard.detection.statistics import StreamingInt8Stats
+    rng = np.random.default_rng(0)
+    for n in (5, 20, 500):
+        X = np.clip(rng.normal(10, 5, size=(n, 8)), -128, 127).astype(np.int8)
+        s = StreamingInt8Stats("l")
+        for x in X:
+            s.update(x)
+        st = s.finalize()
+        ref = np.cov(X.astype(np.float64), rowvar=False)
+        est = st.cov - np.eye(8) * 1e-4          # remove the ridge added in finalize()
+        assert np.allclose(est, ref, rtol=1e-10, atol=1e-10)

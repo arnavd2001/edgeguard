@@ -1,0 +1,123 @@
+% =====================================================================
+%  EdgeGuard: Integrity Attestation and Layerwise Intrusion Detection
+%  for Quantized Neural Networks on Edge Accelerators
+%
+%  M.Tech Project Report -- CS24M513, IIT Madras, 2026
+%  Prepared with AI assistance (Claude, Anthropic) -- see the
+%  "Statement on the Use of AI Tools" in the front matter.
+%
+%  Build:  cd report/thesis && latexmk -pdf main.tex
+%  All experimental numbers are \input from ../generated/, which is
+%  produced by experiments/make_tables.py from experiments/results/.
+% =====================================================================
+\documentclass[12pt,a4paper,oneside]{report}
+
+\usepackage[a4paper,top=1in,bottom=1in,left=1.25in,right=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{mathptmx}
+\renewcommand{\ttdefault}{lmtt}
+\usepackage{setspace}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs,longtable,array,multirow,tabularx}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,shapes.misc,fit,backgrounds,calc,decorations.pathreplacing}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{tocloft}
+\usepackage{pifont}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+
+\onehalfspacing
+\setlength{\parskip}{0.35em}
+\graphicspath{{../figures/}}
+
+% ---- colours used in diagrams (validated categorical slots 1-3) -------
+\definecolor{egblue}{HTML}{257DE0}
+\definecolor{egorange}{HTML}{F47230}
+\definecolor{egaqua}{HTML}{00B894}
+\definecolor{egink}{HTML}{191919}
+\definecolor{eggray}{HTML}{666666}
+\definecolor{eglight}{HTML}{EEF4FC}
+
+% ---- headers -----------------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\nouppercase{\leftmark}}
+\fancyhead[R]{\small EdgeGuard}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+\titleformat{\chapter}[display]{\normalfont\huge\bfseries}{\chaptertitlename\ \thechapter}{12pt}{\Huge}
+\titlespacing*{\chapter}{0pt}{-10pt}{30pt}
+
+% ---- code listings -----------------------------------------------------
+\lstdefinestyle{eg}{
+  basicstyle=\ttfamily\footnotesize, keywordstyle=\color{egblue}\bfseries,
+  commentstyle=\color{eggray}\itshape, stringstyle=\color{egorange!80!black},
+  breaklines=true, frame=lines, framesep=4pt, numbers=left, numberstyle=\tiny\color{eggray},
+  xleftmargin=1.5em, tabsize=4, showstringspaces=false, columns=fullflexible, keepspaces=true}
+\lstset{style=eg,language=Python,
+  literate={—}{{---}}1 {→}{{$\to$}}1 {✓}{{\checkmark}}1 {•}{{$\bullet$}}1}
+
+% ---- theorem environments ---------------------------------------------
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[chapter]
+\newtheorem{assumption}{Assumption}[chapter]
+\theoremstyle{plain}
+\newtheorem{proposition}{Proposition}[chapter]
+\newtheorem{lemma}[proposition]{Lemma}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}[chapter]
+
+% ---- macros --------------------------------------------------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\cmark}{\ding{51}}
+\newcommand{\xmark}{\ding{55}}
+\newcommand{\pmark}{$\circ$}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\Hash}{\mathrm{H}}
+\DeclareMathOperator{\clamp}{clamp}
+\DeclareMathOperator{\round}{round}
+
+\input{../generated/numbers.tex}
+
+% =====================================================================
+\begin{document}
+
+\pagenumbering{roman}
+\input{chapters/00_frontmatter}
+
+\cleardoublepage
+\pagenumbering{arabic}
+\input{chapters/01_introduction}
+\input{chapters/02_background}
+\input{chapters/03_related_work}
+\input{chapters/04_threat_model}
+\input{chapters/05_design}
+\input{chapters/06_implementation}
+\input{chapters/07_evaluation}
+\input{chapters/08_discussion}
+\input{chapters/09_conclusion}
+
+\cleardoublepage
+\phantomsection
+\addcontentsline{toc}{chapter}{References}
+\input{chapters/references}
+
+\appendix
+\input{chapters/appendices}
+
+\end{document}

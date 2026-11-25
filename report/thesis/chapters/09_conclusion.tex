@@ -1,0 +1,110 @@
+\chapter{Conclusion and Future Work}
+\label{ch:conclusion}
+
+\section{Summary}
+
+This report presented \textsc{EdgeGuard}, a framework that combines signed Merkle-tree
+attestation of quantized weights with an INT8 activation monitor and a rule-based threat
+classifier, together with a testbed of attack simulators and language-model-shaped weight sets.
+The evaluation, generated end to end from recorded runs, supports five conclusions.
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Cryptographic attestation does what it should, and localises exactly.} Every
+        simulated weight modification was detected and attributed to exactly the tensors that
+        changed, from single least-significant bits to perturbations spread over every tensor.
+        This result does not depend on the simulation.
+  \item \textbf{The monitor's false-positive rate is governed by the number of channels.} A
+        per-channel $4\sigma$ rule over \MChannels{} channels flagged \EmpFPRZFour{} of clean
+        inputs, matching the \PredFPRZFour{} predicted by \cref{eq:fwer}. A Bonferroni threshold
+        reduced this to \EmpFPRBonf{} with no loss of detection in the simulated scenarios. For a
+        real language model, with tens of thousands of channels, this correction is essential.
+  \item \textbf{The two detectors are complementary.} Synergy inputs that kept activations near
+        the clean distribution were flagged by the monitor at \MonSynergy{} and by the combined
+        pipeline at \FlagSynergy{}.
+  \item \textbf{The labels need better evidence, not better tuning.} Single-tensor supply-chain
+        modifications cannot be distinguished from runtime flips without temporal evidence. The
+        early/late rule labels pervasive input attacks as faults, and the entropy score cannot
+        respond to shifted or narrowed activations.
+  \item \textbf{Full attestation does not scale to per-inference use for LLMs.} At about
+        \MerkThrMin{}--\MerkThrMax{}\,MiB/s, verifying 1.4\,GiB took 1.6\,s. The Merkle structure supports
+        amortised verification with a deterministic bound of about 315 tokens at a 5\,ms-per-token
+        budget, or probabilistic bounds under randomisation.
+\end{enumerate}
+
+Building the evaluation also uncovered three defects, two integer-width errors in the bit-flip
+and cold-boot simulators and one algebraic error in the streaming covariance. Each had passed
+tests that checked intended behaviour. All three were fixed and covered by regression tests
+against independent references.
+
+\section{Limitations}
+
+The principal limitation is that activation-level results come from simulated activations whose
+distributions were chosen together with the detector. They show that the pipeline functions as
+designed, not that it detects real attacks. No real model was executed, no NPU was used, and no
+adaptive attacker was evaluated. The memorisation score's premise, that extraction probes produce
+distinctive late-layer activations, is a hypothesis that this project has not tested.
+
+\section{Plan for the next phase}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[x=0.9cm, y=0.62cm]
+\foreach \m/\lab in {0/Dec,1/Jan,2/Feb,3/Mar,4/Apr,5/May} {
+  \node[font=\scriptsize, text=eggray] at (\m*2+1,0.7) {\lab};
+  \draw[eggray!40] (\m*2,0.3) -- (\m*2,-8.4);
+}
+\draw[eggray!40] (12,0.3) -- (12,-8.4);
+\foreach \y/\t/\s/\e/\c in {
+  0/W1: label and explanation fixes/0/1/egaqua,
+  1/W2: real-model activation capture (PyTorch)/0.5/3/egblue,
+  2/W3: memorisation hypothesis test/2/4.5/egblue,
+  3/W4: threshold calibration on real data/3/5/egblue,
+  4/W5: amortised attestation + keyed MAC/3.5/6.5/egorange,
+  5/W6: QNN adapter on Snapdragon device/5/9/egorange,
+  6/W7: adaptive-attacker study/7/10/egblue,
+  7/W8: thesis writing and submission/9.5/12/egaqua} {
+  \node[font=\scriptsize, anchor=east] at (-0.1,-\y-0.6) {\t};
+  \fill[\c, rounded corners=1pt] (\s,-\y-0.35) rectangle (\e,-\y-0.85);
+}
+\end{tikzpicture}
+\caption{Indicative schedule for the next phase (December 2026 -- May 2027). Blue: evaluation on
+real models; orange: systems work; aqua: fixes and writing.}
+\label{fig:gantt}
+\end{figure}
+
+The next phase replaces simulation with measurement wherever possible. \Cref{fig:gantt} shows an
+indicative schedule.
+
+\begin{description}[leftmargin=*,style=nextline]
+  \item[W1 — Fixes from this evaluation.] Replace the early-share rule with a comparison of
+        anomaly rates; reword the signature line of explanations; bind dtype and leaf count into
+        the hashes and add domain separation (\cref{rem:padding}); make Bonferroni the default
+        threshold; emit structured evidence alongside labels.
+  \item[W2 — Real activations.] Run a small open-weight model, quantized to INT8, under PyTorch
+        with forward hooks. Capture activations from benign prompts for calibration and from
+        published jailbreak and prompt-injection sets for evaluation. Measure the clean
+        false-positive rate at the Bonferroni threshold on real, non-Gaussian activations.
+  \item[W3 — Memorisation hypothesis.] Compare late-layer statistics during generation of known
+        memorised sequences and matched controls (\cref{sec:disc:llm}). Keep, refit or drop the
+        memorisation score according to the result.
+  \item[W4 — Calibration on real data.] Fit thresholds with held-out empirical quantiles as well as
+        Bonferroni, and compare diagonal, low-rank and full covariance models.
+  \item[W5 — Amortised attestation.] Implement randomised, size-weighted partial verification with
+        Merkle proofs and a keyed-MAC fast path. Measure detection latency against injected flips
+        during generation.
+  \item[W6 — Device integration.] Implement the QNN adapter against the Qualcomm AI Engine Direct
+        SDK, expose selected intermediate tensors from the HTP backend, and measure overhead on a
+        Snapdragon development device.
+  \item[W7 — Adaptive attacker.] Optimise adversarial prompts against a model with the monitor's
+        thresholds as a constraint, and report how much the monitor raises the attack cost.
+  \item[W8 — Writing.] Consolidate the results into the final thesis and, if they warrant it, a
+        workshop paper.
+\end{description}
+
+\section{Closing remark}
+
+The most useful outcome of this phase is a clear map of where the project stands. The
+cryptographic half of \textsc{EdgeGuard} is sound, and its main open problem is cost. The
+statistical half is wired correctly and its false-positive behaviour is understood, but its
+detection ability remains unproven until it meets real activations. The next phase is designed to
+supply that evidence.

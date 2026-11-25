@@ -125,8 +125,10 @@ class StreamingInt8Stats:
 
         # Cross-product for covariance
         if self._C is not None:
-            # Incremental covariance: (n-1)/n * outer(delta, delta2)
-            self._C += ((self._n - 1) / self._n) * np.outer(delta, delta2)
+            # Welford co-moment update: C_n = C_{n-1} + (x - mu_{n-1})(x - mu_n)^T.
+            # (An earlier version also multiplied by (n-1)/n, applying the
+            # correction twice and biasing the covariance low.)
+            self._C += np.outer(delta, delta2)
 
     def finalize(self) -> LayerStats:
         """

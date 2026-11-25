@@ -1,0 +1,195 @@
+\chapter{Related Work}
+\label{ch:related}
+
+This chapter reviews the prior work that \textsc{EdgeGuard} builds on or competes with. It is
+organised by threat: fault attacks on weights (\cref{sec:rw:bfa}) and defences against them
+(\cref{sec:rw:bfadef}); adversarial inputs and feature-space detection (\cref{sec:rw:adv});
+extraction of models and training data (\cref{sec:rw:extract}); supply-chain manipulation of
+weights (\cref{sec:rw:supply}); and TEE-based protection (\cref{sec:rw:tee}).
+\Cref{sec:rw:gap} positions this project against them.
+
+% ---------------------------------------------------------------------------
+\section{Fault attacks on model weights}
+\label{sec:rw:bfa}
+
+\paragraph{Rowhammer.} Kim et al.\ showed that repeatedly activating a DRAM row can flip bits
+in physically adjacent rows without accessing them \cite{kim2014flipping}. The effect gives
+unprivileged software a write primitive into memory it does not own, and it has since been
+exploited from cloud tenants, browsers and mobile applications.
+
+\paragraph{Sensitivity of networks to single flips.} Neural networks tolerate random noise in
+their parameters well, which long suggested that hardware faults were a minor concern. Hong et
+al.\ challenged this view \cite{hong2019terminal}. Across 19 models covering six architectures
+and three image tasks, most models had at least one parameter whose single bit flip caused an
+accuracy loss of more than 90\%, and an estimated 40--50\% of parameters could cause a drop of
+more than 10\% when flipped individually. Their analysis covered floating-point models, where
+flipping a high exponent bit is catastrophic. The same work demonstrated a practical Rowhammer
+attack in a simulated machine-learning-as-a-service setting.
+
+\paragraph{Attacks on quantized models.} Quantization was initially thought to remove the
+exponent-bit vulnerability. Rakin, He and Fan's bit-flip attack (BFA) showed otherwise
+\cite{rakin2019bfa}. It uses gradient information to search progressively for the bits whose
+flipping most increases the loss, and it degrades 8-bit quantized ResNet models to near-random
+accuracy with a few tens of flips out of tens of millions of weight bits. DeepHammer by Yao,
+Rakin and Fan turned this search into an end-to-end hardware attack \cite{yao2020deephammer}.
+It constrains the search to bits that are actually flippable on the victim's DRAM, uses memory
+massaging to place victim weight pages on vulnerable rows, and degraded the accuracy of 12
+architectures across four datasets to the level of random guessing within minutes. DeepHammer
+also reports that randomly flipping even 100 bits in an 8-bit ResNet-20 barely changes accuracy,
+so effective attacks are necessarily targeted. This observation shapes the attack simulators in
+\cref{sec:impl:attacks}.
+
+% ---------------------------------------------------------------------------
+\section{Defences against weight fault attacks}
+\label{sec:rw:bfadef}
+
+Defences fall into three groups.
+
+\paragraph{Making the model harder to attack.} He et al.\ studied binarization-aware training
+and piece-wise weight clustering as ways to raise the number of flips an attacker needs
+\cite{he2020defending}. Li et al.\ proposed reconstructing weights at inference time so that the
+effect of a flipped bit is spread over a group, which maintained 60\% ImageNet accuracy after
+five iterations of a greedy progressive attack, compared with below 1\% for the undefended
+baseline \cite{li2020defending}. These approaches change the model or its training and do not
+report whether an attack occurred.
+
+\paragraph{Detecting modification with signatures.} RADAR by Li et al.\ groups interleaved
+weights, derives a 2-bit addition-checksum signature per group, and compares it at run time with
+a securely stored reference \cite{li2021radar}. It detects about 9.6 out of 10 injected flips on
+ResNet-18 and zeroes flagged groups to recover accuracy, adding under 1\% to inference time in a
+gem5 simulation. HASHTAG by Javaheripi and Koushanfar identifies the layers most sensitive to
+fault injection and hashes their weights with a low-collision (Pearson) hash, comparing against
+ground-truth signatures during inference \cite{javaheripi2021hashtag}. ModelShield by Guo et al.\
+performs real-time hash verification of weights as an extension to existing frameworks
+\cite{guo2021modelshield}. These works establish that hashing weights at run time is effective
+against BFA, and \textsc{EdgeGuard}'s attestation component belongs to the same family. It
+differs in using a collision-resistant hash over every tensor, a Merkle tree for localisation,
+and a signature on the root. Lightweight checksums can be defeated by an attacker who knows the
+checksum and flips compensating bits. A cryptographic hash cannot be defeated this way, at the
+price of higher cost, which \cref{sec:eval:merkle} measures.
+
+\paragraph{Luring the attacker.} NeuroPots by Liu et al.\ embeds ``honey neurons'' into the
+model as deliberately vulnerable points \cite{liu2023neuropots}. Attack searches tend to
+concentrate their flips there, so a checksum over the small trapdoor region is enough to detect
+the attack and recover the model. The approach reduces the region that must be checked, which
+directly addresses the cost problem.
+
+% ---------------------------------------------------------------------------
+\section{Adversarial inputs and feature-space detection}
+\label{sec:rw:adv}
+
+Goodfellow et al.\ explained adversarial examples by the locally linear behaviour of networks
+and introduced the fast gradient sign method \cite{goodfellow2015explaining}. Madry et al.\
+formulated robustness as a saddle-point problem and used projected gradient descent both to
+attack and to train robust models \cite{madry2018towards}.
+
+Detection, as opposed to robust training, often works in feature space. Lee et al.\ fit a
+class-conditional Gaussian with a shared covariance to the features of each layer of a trained
+classifier \cite{lee2018simple}. They score a test input by its Mahalanobis distance to the
+closest class mean and combine scores across layers. The method detects both out-of-distribution
+samples and adversarial examples without retraining the classifier. \textsc{EdgeGuard}'s
+monitor uses the same statistic in a simpler, class-agnostic form: one Gaussian per monitored
+layer, fitted on INT8 activations from clean inputs. Being class-agnostic makes it applicable to
+generative models, where there are no class labels. It is also less discriminative, because the
+clean distribution it models is broader.
+
+% ---------------------------------------------------------------------------
+\section{Extraction of models and training data}
+\label{sec:rw:extract}
+
+\paragraph{Model extraction.} Tram\`er et al.\ showed that models exposed through prediction
+APIs can be replicated with a number of queries close to the number of parameters for simple
+model classes \cite{tramer2016stealing}. With physical access, extraction is more direct.
+Halderman et al.\ showed that DRAM retains its contents for seconds to minutes after power
+loss, longer when cooled, which allows memory contents to be recovered by rebooting into a
+custom image \cite{halderman2008lest}. The cold-boot channel model in
+\cref{sec:impl:attacks} simulates such a recovery with a small rate of single-bit decay errors.
+
+\paragraph{Training-data extraction.} Carlini et al.\ generated large numbers of samples from
+GPT-2 and ranked them with membership-inference metrics. Hundreds of the top-ranked samples
+were verbatim training sequences, including names, phone numbers and addresses
+\cite{carlini2021extracting}. Nasr et al.\ extended extraction to open and closed production
+models and showed that aligned chat models can be prompted to emit training data at much
+higher rates than in normal use \cite{nasr2023scalable}. Dai, Lu and Zhou introduced the
+activation inversion attack \cite{dai2025activation}. In decentralised (pipeline-parallel)
+training, an attacker who observes the activations passed between stages trains a model on a
+shadow dataset of text--activation pairs and uses it to reconstruct the training text. That
+work concerns activations transmitted during training rather than inference on a device, but it
+establishes that intermediate activations carry recoverable information about the input text.
+
+The extraction-probe simulator in \textsc{EdgeGuard} does not implement any of these attacks.
+It models a hypothesis: queries that make a model regurgitate memorised content produce
+abnormally confident, low-variance late-layer activations. This hypothesis is plausible, but it
+has not been validated on a real model in this project, and \cref{ch:discussion} treats it
+accordingly.
+
+% ---------------------------------------------------------------------------
+\section{Supply-chain manipulation of weights}
+\label{sec:rw:supply}
+
+Practitioners routinely download pretrained weights from public repositories and fine-tune
+them. Feng and Tram\`er showed that an attacker who tampers with the pretrained weights can
+plant ``data traps'' that record individual fine-tuning examples into the weights, allowing the
+attacker to reconstruct them later \cite{feng2024privacy}. The traps can also yield perfect
+membership inference and defeat loose differential-privacy guarantees. Wen et al.\
+independently showed that poisoned pretrained models can amplify membership-inference leakage
+from fine-tuning data \cite{wen2024privacy}. Both results make the provenance of weights a
+security property. A signed attestation of the weights shipped to a device cannot by itself
+reveal a backdoor planted before signing. It can, however, ensure that the weights on the device
+are the ones the vendor signed, so that tampering after signing is detected.
+
+% ---------------------------------------------------------------------------
+\section{Trusted execution for model protection}
+\label{sec:rw:tee}
+
+TEEs protect code and data from the rest of the system but have limited memory and no
+accelerator access. Amulet by Mao et al.\ obfuscates the weights inside a TEE, stores the
+transformed model in untrusted memory, and runs it on an external accelerator with only two TEE
+interactions per inference \cite{mao2025amulet}. It reports near-identical accuracy with latency
+within $4.8\times$ of unprotected GPU inference across models from ResNet-18 to GPT-2.
+Amulet targets \emph{confidentiality} of the weights against extraction, whereas
+\textsc{EdgeGuard} targets \emph{integrity} and \emph{runtime anomaly detection}. The two are
+complementary. In particular, a TEE is the natural home for \textsc{EdgeGuard}'s verification
+key and attestation logic.
+
+% ---------------------------------------------------------------------------
+\section{Positioning of this work}
+\label{sec:rw:gap}
+
+\Cref{tab:related} compares the systems discussed above along the dimensions relevant to this
+project. Each entry reflects what the cited paper reports. A circle (\pmark) marks partial
+coverage.
+
+\begin{table}[t]
+\centering
+\caption{Coverage of related defences. \cmark: addressed; \pmark: partially; \xmark: not
+addressed in the cited work. ``Localises'' means the defence identifies where the modification
+occurred.}
+\label{tab:related}
+\small
+\resizebox{\textwidth}{!}{\begin{tabular}{lcccccc}
+\toprule
+\textbf{System} & \textbf{Detects} & \textbf{Crypto.} & \textbf{Localises} & \textbf{Input} &
+\textbf{Labels} & \textbf{Evaluated} \\
+ & \textbf{weight mod.} & \textbf{strength} & & \textbf{anomalies} & \textbf{threat} & \textbf{on LLMs} \\
+\midrule
+Weight reconstr.\ \cite{li2020defending} & \xmark & \xmark & \xmark & \xmark & \xmark & \xmark \\
+RADAR \cite{li2021radar}                 & \cmark & \xmark & \cmark (group) & \xmark & \xmark & \xmark \\
+HASHTAG \cite{javaheripi2021hashtag}     & \cmark & \xmark & \pmark (layer) & \xmark & \xmark & \xmark \\
+ModelShield \cite{guo2021modelshield}    & \cmark & \pmark & \pmark & \xmark & \xmark & \xmark \\
+NeuroPots \cite{liu2023neuropots}        & \cmark & \xmark & \cmark (trapdoor) & \xmark & \xmark & \xmark \\
+Mahalanobis det.\ \cite{lee2018simple}   & \xmark & \xmark & \xmark & \cmark & \xmark & \xmark \\
+Amulet \cite{mao2025amulet}              & \xmark & \xmark & \xmark & \xmark & \xmark & \pmark (GPT-2) \\
+\midrule
+\textsc{EdgeGuard} (this work)           & \cmark & \cmark & \cmark (tensor) & \cmark & \cmark & \pmark (stub) \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Two points in \cref{tab:related} need qualification. First, \textsc{EdgeGuard}'s ``evaluated on
+LLMs'' is marked partial because only structural stubs are used. Second, the table records
+coverage, not effectiveness. RADAR, HASHTAG and NeuroPots were evaluated on real models under
+real attacks, whereas \textsc{EdgeGuard}'s activation results come from simulation. The defensible
+claim of this project is narrower than ``a better defence''. It is a working integration of
+cryptographic attestation with INT8 activation monitoring and threat labelling, with a measured
+characterisation of what each part contributes and what it costs.

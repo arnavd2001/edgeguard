@@ -1,0 +1,187 @@
+% ---------------------------------------------------------------- title
+\begin{titlepage}
+\begin{center}
+\vspace*{0cm}
+{\LARGE\bfseries EdgeGuard: Integrity Attestation and\\[0.2cm]
+Layerwise Intrusion Detection for\\[0.2cm]
+Quantized Neural Networks on Edge Accelerators\par}
+\vspace{1.0cm}
+{\large A Project Report\\[0.2cm] submitted in partial fulfilment of the requirements\\
+for the award of the degree of\par}
+\vspace{0.6cm}
+{\Large\bfseries Master of Technology\par}
+\vspace{0.3cm}
+{\large in\\[0.2cm] Computer Science and Engineering\par}
+\vspace{0.9cm}
+{\large by\par}
+\vspace{0.3cm}
+{\Large\bfseries Arnav Deshpande\par}
+{\large (CS24M513)\par}
+\vspace{0.5cm}
+{\normalsize Prepared with AI assistance from Claude (Anthropic);\\
+see the Statement on the Use of AI Tools.\par}
+\vfill
+{\large\bfseries Department of Computer Science and Engineering\\[0.15cm]
+Indian Institute of Technology Madras\\[0.15cm]
+Chennai 600\,036\par}
+\vspace{0.4cm}
+{\large November 2026\par}
+\end{center}
+\end{titlepage}
+
+% ---------------------------------------------------------------- certificate
+\chapter*{Certificate}
+\addcontentsline{toc}{chapter}{Certificate}
+This is to certify that the report titled \textbf{EdgeGuard: Integrity Attestation and Layerwise
+Intrusion Detection for Quantized Neural Networks on Edge Accelerators}, submitted by
+\textbf{Arnav Deshpande (CS24M513)} to the Indian Institute of Technology Madras in partial
+fulfilment of the requirements for the award of the degree of Master of Technology, is a
+record of the project work carried out under my supervision.
+
+\vspace{3cm}
+\noindent
+\begin{tabular}{@{}l@{\hspace{5cm}}l}
+\rule{5cm}{0.4pt} & \\
+\textbf{[Name of Guide]} & Place: Chennai \\
+Project Guide & Date: \\
+Department of Computer Science and Engineering & \\
+IIT Madras &
+\end{tabular}
+
+% ---------------------------------------------------------------- AI statement
+\chapter*{Statement on the Use of AI Tools}
+\addcontentsline{toc}{chapter}{Statement on the Use of AI Tools}
+This project was carried out with substantial assistance from Claude, a large language model
+developed by Anthropic, which is credited as a co-author on the commits in the project
+repository (\url{https://github.com/arnavd2001/edgeguard}). The assistance covered:
+
+\begin{itemize}[leftmargin=*]
+  \item drafting and debugging the Python implementation of the \textsc{EdgeGuard} framework,
+        the attack simulators and the test suite;
+  \item designing and running the experiments reported in \cref{ch:evaluation}, and generating
+        the figures and tables from the recorded results;
+  \item drafting the text of this report.
+\end{itemize}
+
+\noindent
+Every experimental number in this report is produced by the scripts in
+\code{experiments/} and is inserted into the document automatically from
+\code{experiments/results/results.json}; no result was typed by hand. Every bibliographic
+reference was checked against the publisher's page, the arXiv listing or a bibliographic
+database (DBLP, Crossref, PMLR, ACL Anthology). An earlier draft of this report contained
+results that had not been measured and references that could not be verified; those were
+removed, and the corresponding sections were rewritten from measured data.
+
+\noindent
+The candidate is responsible for the content of this report, has reviewed it, and should be
+able to explain every design decision and result in it.
+
+\vspace{1.5cm}
+\noindent Arnav Deshpande \hfill Date: \underline{\hspace{3cm}}
+
+% ---------------------------------------------------------------- acknowledgements
+\chapter*{Acknowledgements}
+\addcontentsline{toc}{chapter}{Acknowledgements}
+\textit{[To be written by the candidate.]}
+
+% ---------------------------------------------------------------- abstract
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+
+Neural networks deployed on edge accelerators are stored and executed as 8-bit integer (INT8)
+tensors in memory that an attacker may be able to read or corrupt. Three families of attack
+are well documented: bit flips induced in DRAM that destroy or hijack a model, adversarial
+inputs that steer it, and extraction of weights or memorised training data from it. Defences
+in the literature usually address one family at a time. This report describes
+\textsc{EdgeGuard}, a Python framework that combines two independent checks and a rule-based
+classifier that labels what it sees.
+
+The first check is a Merkle tree of SHA-256 digests over the model's weight tensors, with an
+ECDSA P-256 signature on the root. It detects any change to the stored weights and names the
+tensor that changed. The second check is a per-layer activation monitor calibrated with
+Welford's streaming algorithm directly on INT8 activations, scoring each inference with a
+channel-wise $z$-score and a Mahalanobis distance. A classifier maps the joint outcome to one of
+eight reachable threat labels and emits a layer-by-layer explanation. The framework includes
+simulators for bit-flip, supply-chain, adversarial-input, training-data-extraction and combined
+(``synergy'') attacks, and a generator of INT8 weight sets shaped like five open-weight
+language models.
+
+Evaluation is carried out on simulated activations, with \NPerScenario{} inputs per scenario
+across \NSeeds{} seeds. The Merkle check flagged every weight-modifying input in every scenario
+and localised the modified tensor exactly in every case. The activation monitor alone flagged
+only \MonSynergy{} of synergy inputs, which perturb weights and suppress the activation signal,
+so the combined pipeline catches inputs that activation monitoring alone misses. A fixed
+$4\sigma$ threshold produced a \EmpFPRZFour{} false-positive rate on clean inputs, which matches
+the \PredFPRZFour{} predicted by a multiple-comparisons argument over \MChannels{} monitored
+channels; a Bonferroni-corrected threshold of $z^*=\ZBonf$ reduced it to \EmpFPRBonf{} while
+still flagging all three activation-level attack scenarios. Re-hashing a 1.4\,GiB weight set took
+\MerkVerLlamaPB{}\,ms on the test machine, which rules out full attestation on every inference
+for language-model-sized weights and motivates the amortised schemes discussed in
+\cref{ch:discussion}. Because the attack generators and the detector were written together,
+the activation-level results measure the internal consistency of the simulation rather than
+robustness to an adaptive attacker; this limitation and a plan to evaluate on real models on a
+Qualcomm Hexagon NPU are set out in \cref{ch:conclusion}.
+
+\vspace{0.5cm}
+\noindent\textbf{Keywords:} edge AI security, quantized neural networks, bit-flip attacks,
+Merkle trees, anomaly detection, Mahalanobis distance, training-data extraction, NPU.
+
+% ---------------------------------------------------------------- lists
+\cleardoublepage
+\tableofcontents
+\cleardoublepage
+\listoffigures
+\addcontentsline{toc}{chapter}{List of Figures}
+\cleardoublepage
+\listoftables
+\addcontentsline{toc}{chapter}{List of Tables}
+
+% ---------------------------------------------------------------- abbreviations
+\chapter*{Abbreviations}
+\addcontentsline{toc}{chapter}{Abbreviations}
+\begin{tabular}{@{}p{2.6cm}p{11cm}@{}}
+AUC   & Area under the (ROC) curve \\
+BFA   & Bit-flip attack \\
+CVD   & Colour-vision deficiency \\
+DMA   & Direct memory access \\
+DRAM  & Dynamic random-access memory \\
+ECDSA & Elliptic Curve Digital Signature Algorithm \\
+EM    & Electromagnetic (side channel) \\
+FFN   & Feed-forward network (transformer MLP block) \\
+FPR   & False-positive rate \\
+FP32  & 32-bit IEEE-754 floating point \\
+HTP   & Hexagon Tensor Processor \\
+INT8  & 8-bit signed two's-complement integer \\
+LLM   & Large language model \\
+LSB / MSB & Least / most significant bit \\
+NPU   & Neural processing unit \\
+PBFA  & Progressive bit-flip attack \\
+PTQ   & Post-training quantization \\
+QAT   & Quantization-aware training \\
+QNN   & Qualcomm AI Engine Direct SDK (``Qualcomm Neural Network'') \\
+ROC   & Receiver operating characteristic \\
+SHA-256 & Secure Hash Algorithm, 256-bit output \\
+TEE   & Trusted execution environment \\
+TOCTOU & Time of check to time of use \\
+TPR   & True-positive rate \\
+\end{tabular}
+
+% ---------------------------------------------------------------- notation
+\chapter*{Notation}
+\addcontentsline{toc}{chapter}{Notation}
+\begin{tabular}{@{}p{2.6cm}p{11cm}@{}}
+$L_i$                     & $i$-th weight tensor of a model, $i = 0,\dots,n-1$ \\
+$n$                       & number of weight tensors (Merkle leaves) \\
+$\Hash(\cdot)$            & SHA-256 \\
+$h_i$                     & leaf digest of $L_i$ \\
+$r$                       & Merkle root \\
+$\sigma$                  & ECDSA signature on $r$ \\
+$\mathbf{a}_\ell\in\Z^{d}$ & INT8 activation vector at monitored layer $\ell$, dimension $d$ \\
+$\boldsymbol\mu_\ell,\boldsymbol\sigma_\ell$ & per-channel calibration mean and standard deviation \\
+$\hat\Sigma_\ell$         & calibration covariance; $\hat\Sigma_\ell^{+}$ its pseudo-inverse \\
+$Z_\ell$                  & max channel $|z|$-score at layer $\ell$ \\
+$D_\ell$                  & Mahalanobis distance at layer $\ell$ \\
+$\tau_z,\tau_D$           & $z$-score and Mahalanobis thresholds \\
+$m$                       & total monitored channels, $m=\sum_\ell d_\ell$ \\
+$s, z_0$                  & quantization scale and zero point \\
+\end{tabular}

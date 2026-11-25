@@ -1,0 +1,288 @@
+\chapter{Implementation}
+\label{ch:implementation}
+
+This chapter describes the software that realises the design: its structure
+(\cref{sec:impl:structure}), the core components (\cref{sec:impl:core}), the attack simulators
+(\cref{sec:impl:attacks}), the language-model weight generator (\cref{sec:impl:stub}), the test
+suite (\cref{sec:impl:tests}), and three defects found during evaluation and how they were fixed
+(\cref{sec:impl:bugs}).
+
+% ---------------------------------------------------------------------------
+\section{Structure and dependencies}
+\label{sec:impl:structure}
+
+\textsc{EdgeGuard} is a pure-Python package that depends on NumPy, SciPy, PyYAML and the
+\code{cryptography} library. PyTorch is an optional dependency, needed only for the forward-hook
+adapter. The repository layout is:
+
+\begin{lstlisting}[language={},numbers=none,frame=single,basicstyle=\ttfamily\scriptsize]
+edgeguard/
+|-- src/edgeguard/
+|   |-- attestation/     merkle.py, manager.py         Merkle tree, signed attestation
+|   |-- detection/       statistics.py, calibration.py, monitor.py
+|   |-- classifier/      classifier.py, rules.py        base threat classifier
+|   |-- llm/             model.py, detector.py          LLM weight stub, LLM detector
+|   |-- attacks/         bitflip.py, weight_extraction.py, training_data_recovery.py,
+|   |                    supply_chain.py, adversarial.py, synergy.py
+|   |-- instrumentation/ hooks.py, qnn_adapter.py      PyTorch hooks, QNN protocol
+|   `-- utils/           crypto.py, quantization.py
+|-- tests/               test_merkle.py, test_monitor.py, test_classifier.py,
+|                        test_llm_detector.py, attacks/test_attacks.py
+|-- experiments/         run_evaluation.py, make_figures.py, make_tables.py, results/
+|-- scripts/             build_merkle.py, calibrate.py, evaluate.py   (CLI tools)
+|-- configs/default.yaml
+`-- report/              this document; figures/ and generated/ are produced by experiments/
+\end{lstlisting}
+
+\Cref{tab:modules} lists the modules with their sizes.
+
+\begin{table}[t]
+\centering
+\caption{Source modules and line counts (including docstrings and comments).}
+\label{tab:modules}
+\small
+\begin{tabular}{llr}
+\toprule
+\textbf{Package} & \textbf{Module} & \textbf{Lines} \\
+\midrule
+attestation     & \code{merkle.py} (tree, proofs, localisation)          & 222 \\
+                & \code{manager.py} (build/verify/save/load, ECDSA)      & 232 \\
+detection       & \code{statistics.py} (Welford, $z$, Mahalanobis)        & 231 \\
+                & \code{calibration.py} (calibration driver, JSON I/O)   & 178 \\
+                & \code{monitor.py} (per-inference scoring)              & 214 \\
+classifier      & \code{classifier.py} (base classifier, explanations)   & 278 \\
+                & \code{rules.py} (confidence heuristics, presets)       & 139 \\
+llm             & \code{model.py} (INT8 weight stub, 5 profiles)          & 209 \\
+                & \code{detector.py} (LLM scores, priority rules)        & 320 \\
+attacks         & \code{bitflip.py}                                      & 217 \\
+                & \code{weight\_extraction.py}                           & 204 \\
+                & \code{training\_data\_recovery.py}                      & 259 \\
+                & \code{supply\_chain.py}                                & 215 \\
+                & \code{adversarial.py}                                  & 153 \\
+                & \code{synergy.py}                                      & 173 \\
+instrumentation & \code{hooks.py}, \code{qnn\_adapter.py}                & 380 \\
+utils           & \code{crypto.py}, \code{quantization.py}               & 264 \\
+\midrule
+\multicolumn{2}{l}{Total, including \code{\_\_init\_\_.py} files} & $\approx$4{,}050 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ---------------------------------------------------------------------------
+\section{Core components}
+\label{sec:impl:core}
+
+\subsection{Hashing and signing}
+
+\Cref{lst:hash} shows the leaf hash of \cref{eq:leaf}. The shape is packed as big-endian
+unsigned 64-bit integers before the raw tensor bytes. \code{tobytes()} returns C-order bytes
+regardless of the array's memory layout, so a transposed view and a contiguous copy with the
+same logical contents hash identically.
+
+\begin{lstlisting}[caption={Leaf hashing (\code{utils/crypto.py}).},label={lst:hash}]
+def hash_weight_tensor(weights: np.ndarray) -> bytes:
+    h = hashlib.sha256()
+    shape_bytes = struct.pack(f">{len(weights.shape)}Q", *weights.shape)
+    h.update(shape_bytes)
+    h.update(weights.tobytes())
+    return h.digest()
+
+def hash_pair(left: bytes, right: bytes) -> bytes:
+    h = hashlib.sha256()
+    h.update(left)
+    h.update(right)
+    return h.digest()
+\end{lstlisting}
+
+Signing uses ECDSA over P-256 with SHA-256 from the \code{cryptography} library. If no key is
+supplied, \code{MerkleAttestationManager.build} generates an ephemeral key pair, which is how
+the experiments run. The attestation, including the leaves, the root, the DER-encoded
+signature and the PEM public key, serialises to JSON. The dtype is not part of the leaf: an
+\code{int8} and a \code{uint8} tensor with identical bytes and shape hash identically. This is
+harmless when the verifier controls how tensors are interpreted, but binding the dtype into the
+leaf would be a cheap hardening step.
+
+\subsection{Streaming statistics}
+
+\Cref{lst:welford} shows the per-layer update. Activations are flattened and cast to
+\code{float64} for accumulation. Integer accumulation would overflow quickly for the
+second-moment terms, and the cost of the cast is negligible next to the outer product.
+
+\begin{lstlisting}[caption={Welford update (\code{detection/statistics.py}), after the fix of \cref{sec:impl:bugs}.},label={lst:welford}]
+def update(self, activation: np.ndarray) -> None:
+    x = activation.flatten().astype(np.float64)
+    ...
+    self._n += 1
+    delta = x - self._mean
+    self._mean += delta / self._n
+    delta2 = x - self._mean
+    self._M2 += delta * delta2              # per-channel variance numerator
+    if self._C is not None:                 # dense co-moment if d <= max_cov_dim
+        self._C += np.outer(delta, delta2)
+\end{lstlisting}
+
+At finalisation, the variance is $M_2/(n-1)$, floored at $10^{-6}$ to avoid division by zero for
+constant channels. The covariance is $C/(n-1)+10^{-4}I$; the small ridge keeps the
+pseudo-inverse stable.
+
+\subsection{Monitor and classifiers}
+
+\code{LayerwiseActivationMonitor.inspect} loops over calibrated layers, computes $Z_\ell$ and
+$D_\ell$, applies the two thresholds, and returns a \code{MonitorResult} with per-layer scores,
+the anomalous set, input-level maxima and an explanation. The base \code{ThreatClassifier}
+implements the weight-evidence and activation-evidence rules of \cref{sec:design:classifier}.
+\code{LLMThreatDetector} wraps it, adds the memorisation and entropy scores, and applies the full
+priority order of \cref{fig:classifier}. Calibration statistics serialise to versioned JSON, so
+that a deployment can ship them alongside the attestation.
+
+\subsection{Command-line tools}
+
+Three scripts wrap the library for use outside Python. \code{build\_merkle.py} generates a key
+pair, builds an attestation from an \code{.npz} archive of weights, and verifies one.
+\code{calibrate.py} fits monitor statistics from an archive of activations. \code{evaluate.py} is
+a three-scenario smoke test for the base classifier, retained from the initial prototype. The
+experiments in \cref{ch:evaluation} use \code{experiments/run\_evaluation.py} instead.
+
+% ---------------------------------------------------------------------------
+\section{Attack simulators}
+\label{sec:impl:attacks}
+
+Each simulator is a class with a \code{seed} argument and returns a dataclass describing what it
+did. Weight attacks copy the weight dictionary before modifying it, a property that the tests
+check. \Cref{tab:simulators} summarises their parameters.
+
+\begin{table}[t]
+\centering
+\caption{Attack simulators and the parameters used in the evaluation.}
+\label{tab:simulators}
+\small
+\begin{tabularx}{\textwidth}{@{}p{2.8cm}p{2.5cm}X@{}}
+\toprule
+\textbf{Simulator} & \textbf{Variant} & \textbf{What it does} \\
+\midrule
+\code{BitFlipAttack} & random & one bit at a uniformly random position, bit and tensor \\
+ & sign\_bit & bit 7 of a uniformly random weight in a tensor \\
+ & targeted & bit 7 of the largest-magnitude weight in a named tensor \\
+ & progressive & bit 7 of the weight whose flip gives the largest change over all tensors (a gradient-free stand-in for PBFA \cite{rakin2019bfa}) \\
+\addlinespace
+\code{SupplyChain-} & steganographic & writes a 16-bit trigger into the LSBs of the first 16 weights of the first tensor \\
+\code{Poisoning} & targeted\_layer & overwrites one row of a named tensor with values in $[100,127)$ \\
+ & distributed & in every tensor, adds an integer in $[-3,3]$ to $\max(1,\lfloor 10^{-4}|L_i|\rfloor)$ random weights \\
+\addlinespace
+\code{AdversarialInput-} & text\_injection & early layers $\mathcal{N}(20, 12.5^2)$; late layers $\mathcal{N}(5, 6^2)$ \\
+\code{Attack} & safety\_bypass & early $\mathcal{N}(15, 10^2)$; late $\mathcal{N}(25, 2.5^2)$ \\
+ & membership\_probe & early $\mathcal{N}(8, 5.5^2)$; late $\mathcal{N}(30, 1.5^2)$ (not used in the main evaluation) \\
+\addlinespace
+\code{TrainingData-} & probe & early layers as clean ($\mathcal{N}(10,5^2)$); late layers mean $15+40f$ where $f$ is the relative depth, std $1.5$ \\
+\code{Recovery} & & \\
+\addlinespace
+\code{WeightExtraction-} & memory\_dump & exact copy \\
+\code{Attack} & cold\_boot & single-bit decay in 0.2\% of bytes (two's-complement correct) \\
+ & em\_side\_channel & $\pm1$ LSB error in 2.5\% of weights \\
+\addlinespace
+\code{SynergyAttack} & targeted + safety\_bypass & targeted BFA on a named tensor; adversarial activations blended toward clean ones with weight 0.65 in early layers and 0.325 in late layers \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+All activation-level simulators draw clean activations from $\mathcal{N}(10, 5^2)$ clipped to the
+INT8 range, the same distribution used for calibration. The attack activations are Gaussian
+with different means and standard deviations, set per layer group as in \cref{tab:simulators}
+(the parameters are absolute values, not offsets from the clean mean). This is the root of the circularity noted in \cref{ch:introduction}:
+the attacks are defined as departures from a distribution that the detector models exactly. The
+synergy simulator implements ``suppression'' as a convex blend toward fresh clean samples. It
+does not model how a real attacker would craft such an input, and its success against the
+monitor is a consequence of the blend weight, not evidence that real synergy attacks are
+feasible.
+
+The distributed-poisoning delta range includes zero, so a sampled weight may be left unchanged.
+The evaluation therefore computes ground truth for localisation from the actual byte difference
+between clean and attacked tensors, not from the simulator's report.
+
+% ---------------------------------------------------------------------------
+\section{Language-model weight stub}
+\label{sec:impl:stub}
+
+\code{QuantizedTransformerStub} produces an ordered dictionary of INT8 tensors with the layout
+of \cref{fig:transformer_layout}. By default, values are drawn from $\mathcal{N}(0,25^2)$ and
+clipped, which roughly fills the INT8 range like a symmetric per-tensor quantization of a
+Gaussian weight matrix. Generation is lazy and cached. For the scaling experiment, the generator
+is replaced by one that draws INT8 integers directly. This avoids the large float64 temporaries
+that a Gaussian draw would create (2\,GiB for the Llama-3.2-1B embedding matrix alone), and it
+does not affect hashing cost, which depends only on the byte count.
+
+% ---------------------------------------------------------------------------
+\section{Test suite}
+\label{sec:impl:tests}
+
+The suite contains \NTests{} tests, listed in full in \cref{app:tests}, and runs in about 40
+seconds. \Cref{tab:test_summary} summarises it.
+
+\begin{table}[t]
+\centering
+\caption{Test suite by file.}
+\label{tab:test_summary}
+\small
+\begin{tabular}{lrp{8.2cm}}
+\toprule
+\textbf{File} & \textbf{Tests} & \textbf{Covers} \\
+\midrule
+\code{test\_merkle.py}         & 17 & tree shapes (1 leaf, powers of two, odd counts), determinism, single- and multi-layer tamper localisation, serialisation round trip, signed build/verify, save/load \\
+\code{test\_monitor.py}        & 17 & Welford mean and variance accuracy, covariance against \code{np.cov} (regression), covariance skipped above $d_{\max}$, scoring functions, calibration save/load, threshold tuning \\
+\code{test\_classifier.py}     & 15 & each base label, priority of weight evidence over activation evidence, rule presets and confidence functions \\
+\code{test\_llm\_detector.py}  & 25 & stub structure and tensor counts for two profiles, dtype and range, every reachable LLM label path, score ranges \\
+\code{attacks/test\_attacks.py}& 43 & each simulator's contract (copies input, determinism, effect size), two's-complement correctness (regression), five end-to-end attack-to-detection chains \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Several tests in \code{test\_llm\_detector.py} accept any of several labels, for example ``not
+CLEAN'', rather than a single expected one. This was a deliberate choice during development,
+because the label boundaries were still moving. It weakens those tests as specifications, and the
+measured label behaviour in \cref{sec:eval:labels} is the more informative record.
+
+% ---------------------------------------------------------------------------
+\section{Defects found during evaluation}
+\label{sec:impl:bugs}
+
+Building the evaluation pipeline exposed three defects in code that had been passing its tests.
+All three are fixed, each with a regression test, and all results in this report were produced
+after the fixes.
+
+\paragraph{1. Sign-bit overflow in the bit-flip simulator.} The original code computed a flip as
+\code{np.int8(int(w[idx]) \^{} (1 << bit))}. For a negative weight and \code{bit} $=7$, the
+Python integer XOR yields a value outside $[-128,127]$ (\cref{sec:bg:twos}), and NumPy 2 raises
+\code{OverflowError}. The random strategy failed this way only when it happened to draw bit 7
+for a negative weight, so short test runs could pass by chance. The fix XORs the
+\code{uint8} view of the byte:
+
+\begin{lstlisting}
+w[idx] = (w[idx].view(np.uint8) ^ np.uint8(1 << bit)).view(np.int8)
+\end{lstlisting}
+
+The sign-bit, targeted and progressive strategies had the same pattern and received the same
+fix.
+
+\paragraph{2. Saturating instead of wrapping in the cold-boot model.} The cold-boot channel XORed
+signed integers and then clipped the result to the INT8 range. A simulated decay of the sign bit
+of $-5$ therefore produced $-128$ instead of $123$. The flip was silently replaced by a
+saturation, which understates the damage of sign-bit decay. The fix again operates on the
+unsigned view, vectorised over the selected bytes. A regression test checks that every corrupted
+byte differs from the original in exactly one bit.
+
+\paragraph{3. Double correction in the streaming covariance.} The co-moment update was written as
+$C \mathrel{+}= \frac{n-1}{n}\,\boldsymbol\delta(\mathbf{x}-\boldsymbol\mu_n)^\top$. The
+standard update is either $\boldsymbol\delta(\mathbf{x}-\boldsymbol\mu_n)^\top$ or
+$\frac{n-1}{n}\boldsymbol\delta\boldsymbol\delta^\top$; the code combined both corrections.
+Since $\mathbf{x}-\boldsymbol\mu_n = \frac{n-1}{n}\boldsymbol\delta$, each term was scaled by
+$\big(\frac{n-1}{n}\big)^2$ instead of $\frac{n-1}{n}$, biasing the covariance low. Measured
+against \code{np.cov}, the maximum relative error was 15.6\% after 20 samples and 1.2\% after
+500. Per-channel variances, which the $z$-score uses, were computed separately and were correct.
+The original tests checked the mean and variance but not the covariance, which is why the defect
+survived. After the fix, every detection decision in the evaluation was unchanged. This indicates
+that, with $\tau_D=50$, the $z$-score threshold made all the decisions in these experiments.
+
+These defects share a lesson that matters for anyone building a bit-flip or statistics testbed.
+Integer-width semantics and estimator algebra are easy to get subtly wrong in high-level code,
+and tests written to check intended behaviour, rather than tests against an independent
+reference such as \code{np.cov} or a bit-level popcount, can let such errors through.

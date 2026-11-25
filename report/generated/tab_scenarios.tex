@@ -1,0 +1,17 @@
+% AUTO-GENERATED
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Scenario} & \textbf{Monitor only} & \textbf{Flagged} & \textbf{Correct label} & \textbf{Mean (ms)} & \textbf{p99 (ms)} \\
+\midrule
+Clean (no attack) & 7.2\% & 7.2\% $\pm$ 1.5 & 92.8\% $\pm$ 1.5 & 1.57 & 3.36 \\
+BFA, random bit & 7.9\% & 100.0\% $\pm$ 0.0 & 100.0\% $\pm$ 0.0 & 1.61 & 3.11 \\
+BFA, sign bit & 7.7\% & 100.0\% $\pm$ 0.0 & 100.0\% $\pm$ 0.0 & 1.52 & 2.53 \\
+BFA, progressive & 7.7\% & 100.0\% $\pm$ 0.0 & 100.0\% $\pm$ 0.0 & 1.59 & 2.60 \\
+Supply chain, LSB stego & 6.9\% & 100.0\% $\pm$ 0.0 & 0.0\% $\pm$ 0.0 & 1.60 & 2.99 \\
+Supply chain, distributed & 7.3\% & 100.0\% $\pm$ 0.0 & 100.0\% $\pm$ 0.0 & 1.63 & 2.84 \\
+Adversarial, text injection & 100.0\% & 100.0\% $\pm$ 0.0 & 100.0\% $\pm$ 0.0 & 1.60 & 2.68 \\
+Adversarial, safety bypass & 100.0\% & 100.0\% $\pm$ 0.0 & 0.0\% $\pm$ 0.0 & 1.61 & 2.55 \\
+Training-data exfil.\ probe & 100.0\% & 100.0\% $\pm$ 0.0 & 100.0\% $\pm$ 0.0 & 1.68 & 3.79 \\
+Synergy (BFA + adversarial) & 4.7\% & 100.0\% $\pm$ 0.0 & 100.0\% $\pm$ 0.0 & 1.54 & 3.29 \\
+\bottomrule
+\end{tabular}

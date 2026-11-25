@@ -1,0 +1,163 @@
+\chapter{Introduction}
+\label{ch:introduction}
+
+\section{Motivation}
+
+Inference on phones, vehicles and embedded controllers is now commonly carried out by a
+dedicated neural processing unit (NPU) rather than by the application CPU. Qualcomm's
+Snapdragon platforms, for example, expose a Hexagon NPU through the Qualcomm AI Engine Direct
+SDK, which provides a unified low-level API across the CPU, GPU and NPU of the chip
+\cite{qualcomm_qnn}. To fit such hardware, a model is first compressed. The most common
+compression is post-training quantization to 8-bit integers (INT8), which cuts weight storage
+to a quarter of its 32-bit floating-point (FP32) size and allows integer-only arithmetic
+\cite{jacob2018quantization,nagel2021whitepaper}. For large language models (LLMs), techniques
+such as GPTQ \cite{frantar2023gptq} and SmoothQuant \cite{xiao2023smoothquant} make 8-bit and
+lower-precision inference practical at billion-parameter scale, and model families such as
+Llama~3.2, Qwen2.5 and Phi-3.5 include sizes intended for on-device use
+\cite{llama3herd,qwen25report,phi3report}.
+
+The deployed artefact is therefore a set of INT8 tensors held in DRAM, read by an accelerator
+through direct memory access, and executed by a vendor runtime. That artefact has three
+security properties worth protecting.
+
+\begin{description}[leftmargin=*,style=nextline]
+  \item[Integrity of the weights.] Rowhammer, first shown by Kim et al.\ \cite{kim2014flipping},
+        lets unprivileged code flip bits in neighbouring DRAM rows. Hong et al.\ showed that most
+        of the 19 image models they studied contain at least one parameter whose single bit flip
+        drops accuracy by more than 90\% \cite{hong2019terminal}. Rakin et al.'s progressive
+        bit-flip attack (PBFA) searches for the most damaging bits in quantized models
+        \cite{rakin2019bfa}, and DeepHammer carried out such an attack end to end on real
+        hardware, degrading accuracy to random guessing within minutes \cite{yao2020deephammer}.
+        Model weights can also be modified before they reach the device, in the model supply
+        chain. Feng and Tram\`er showed that a tampered pretrained model can expose the data
+        on which it is later fine-tuned \cite{feng2024privacy}.
+  \item[Integrity of the computation's inputs.] Adversarial examples, small perturbations of
+        an input chosen to change the output, are a long-established threat
+        \cite{goodfellow2015explaining,madry2018towards}. For LLMs the corresponding threats
+        include prompt injection and attempts to bypass safety training.
+  \item[Confidentiality of the weights and the training data.] Weights can be stolen through
+        a prediction API \cite{tramer2016stealing} or read physically. Cold-boot attacks recover
+        DRAM contents after power loss \cite{halderman2008lest}. Once an attacker can query a
+        model or holds its weights, memorised training data becomes a target. Carlini et al.\
+        extracted verbatim training sequences, including personal information, from GPT-2
+        \cite{carlini2021extracting}. Nasr et al.\ scaled such extraction to production models
+        \cite{nasr2023scalable}. Dai et al.\ reconstructed training text from activations
+        exchanged in decentralised training \cite{dai2025activation}.
+\end{description}
+
+Defences exist for each of these. For weight integrity there are checksum and hash
+signatures over weights \cite{li2021radar,javaheripi2021hashtag,guo2021modelshield}, honeypot
+neurons \cite{liu2023neuropots} and weight reconstruction \cite{li2020defending}. For inputs
+there are feature-space detectors such as the Mahalanobis-distance detector of Lee et al.\
+\cite{lee2018simple}. For confidentiality there are trusted-execution-environment (TEE) designs
+such as Amulet \cite{mao2025amulet}. These defences are typically designed and evaluated in
+isolation, and most image-model defences were not designed with transformer LLM weight layouts
+in mind.
+
+\section{The problem studied}
+
+This project asks whether a single, lightweight runtime layer can provide three things together
+for a quantized model on an edge accelerator:
+
+\begin{enumerate}[label=(\roman*),leftmargin=*]
+  \item a \emph{cryptographic} guarantee that the weights being executed are the weights that
+        were signed at release, with the modified tensor identified when they are not;
+  \item a \emph{statistical} check that each inference's internal activations are consistent
+        with clean behaviour, computed on INT8 values without dequantizing;
+  \item a \emph{label and explanation} for what was detected, so that an operator knows
+        whether to reload weights, drop an input or investigate a probe.
+\end{enumerate}
+
+The motivating observation is that the two checks fail in complementary ways. A hash check
+sees nothing wrong with an adversarial input, because the weights are unchanged. An activation
+monitor can miss a weight attack if the attacker also controls the input and uses it to keep
+activations looking normal. This combined attack is called a \emph{synergy attack} in this
+report. It is a construction used for evaluation, not an attack taken from the literature.
+
+\section{Research questions}
+
+The work is organised around five questions. Each is answered, within the limits of a
+simulation-based study, in \cref{ch:evaluation}.
+
+\begin{description}[leftmargin=*,style=nextline]
+  \item[RQ1 — Weight integrity.] Does per-tensor SHA-256 hashing organised as a signed Merkle
+        tree detect every simulated weight modification, including single-bit and
+        least-significant-bit changes, and does it identify the modified tensor?
+  \item[RQ2 — Activation anomalies.] Does a monitor calibrated on INT8 activations separate the
+        simulated adversarial and extraction-probe inputs from clean ones, and at what
+        false-positive rate?
+  \item[RQ3 — Complementarity.] Does combining the two checks catch inputs that either check
+        alone would miss, in particular synergy inputs?
+  \item[RQ4 — Labelling.] How often does the rule-based classifier assign the intended threat
+        label, and where does it confuse classes?
+  \item[RQ5 — Cost.] What does each check cost per inference, and how does attestation cost
+        scale to weight sets of language-model size?
+\end{description}
+
+\section{Contributions}
+
+The contributions of this phase of the project are stated below. The report is careful to
+separate what was built and measured from what is planned.
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{A combined attestation-and-monitoring framework.} \textsc{EdgeGuard} is an
+        open-source Python package of about 4{,}000 lines (\cref{ch:implementation}). It
+        provides a signed SHA-256 Merkle tree over weight tensors, an INT8 activation monitor
+        built on Welford's streaming statistics \cite{welford1962note}, and a rule-based
+        classifier that produces per-layer explanations. Hash-based weight checking is not new
+        in itself \cite{javaheripi2021hashtag,guo2021modelshield}; the contribution is the
+        integration with activation monitoring and threat labelling, and its application to
+        transformer weight layouts.
+  \item \textbf{A simulation testbed.} The package includes simulators for bit-flip attacks
+        under four strategies, supply-chain poisoning under three, adversarial inputs under
+        three, training-data-extraction probes, physical weight extraction under three channel
+        models, and synergy attacks. It also includes a generator of INT8 weight sets with the
+        tensor shapes and HuggingFace naming of five open-weight language models. A suite of
+        \NTests{} automated tests covers the package.
+  \item \textbf{A measured evaluation with an explained false-positive rate.} All numbers in
+        \cref{ch:evaluation} are generated by a single script from recorded runs. The clean
+        false-positive rate of a fixed $4\sigma$ threshold is shown to follow from a
+        multiple-comparisons argument (predicted \PredFPRZFour{}, measured \EmpFPRZFour{}). A
+        Bonferroni-corrected threshold brings it to \EmpFPRBonf{} without losing any of the
+        activation-level detections.
+  \item \textbf{Evidence for complementarity, and a cost limit.} In simulation, the activation
+        monitor alone flagged \MonSynergy{} of synergy inputs while the combined pipeline
+        flagged \FlagSynergy{}. Full re-attestation of a 1.4\,GiB weight set costs about 1.6\,s
+        on the test machine, which bounds where per-inference attestation is practical.
+  \item \textbf{Engineering findings.} Two defects in the initial attack simulators were found
+        and fixed during the evaluation. Both were integer-overflow errors in the handling of
+        two's-complement sign bits, and both are of a kind that would silently distort a
+        bit-flip study (\cref{sec:impl:bugs}).
+\end{enumerate}
+
+\section{Scope and limitations}
+
+Three limitations should be stated at the outset, because they qualify every result.
+
+First, \textbf{no real model is executed}. The weight sets are random INT8 tensors with
+realistic shapes. The activations are drawn from distributions defined in the attack
+simulators, not produced by running a network. Weight-level results do not depend on this,
+because a hash detects a changed byte regardless of what the byte means. Activation-level
+results do depend on it.
+
+Second, \textbf{the detector and the attack generators were written together}. An activation
+detector that achieves an AUC of 1.0 against attacks whose activation distributions were chosen
+by the same authors demonstrates that the pipeline works end to end. It does not demonstrate
+robustness against an adaptive attacker. \Cref{ch:discussion} discusses this in detail.
+
+Third, \textbf{no NPU measurements are reported}. The QNN adapter in the package is a
+duck-typed interface that has been exercised only with test doubles. Latencies are measured on
+a two-core x86 cloud machine and are reported as such.
+
+\section{Organisation of the report}
+
+\Cref{ch:background} covers the background needed for the rest of the report: quantization,
+the NPU software stack, transformer weight layouts, the cryptographic primitives used, and the
+statistics behind the monitor. \Cref{ch:related} reviews prior work on bit-flip attacks and
+defences, input anomaly detection, model and data extraction, and supply-chain attacks.
+\Cref{ch:threat} states the threat model. \Cref{ch:design} presents the design and argues the
+properties of each component. \Cref{ch:implementation} describes the implementation, the
+attack simulators and the test suite. \Cref{ch:evaluation} reports the experiments.
+\Cref{ch:discussion} interprets them and discusses limitations. \Cref{ch:conclusion} concludes
+and sets out the plan for the next phase. The appendices give the configuration file, the API
+reference, the full test inventory, per-seed results and reproduction instructions.

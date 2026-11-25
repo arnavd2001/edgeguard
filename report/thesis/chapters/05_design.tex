@@ -1,0 +1,444 @@
+\chapter{System Design}
+\label{ch:design}
+
+This chapter presents the design of \textsc{EdgeGuard} and argues the properties claimed for
+each component. \Cref{sec:design:overview} gives the architecture. \Cref{sec:design:merkle}
+covers weight attestation, \cref{sec:design:monitor} the activation monitor,
+\cref{sec:design:classifier} the threat classifier, \cref{sec:design:llm} the
+language-model-specific scores, \cref{sec:design:explain} the explanations and
+\cref{sec:design:adapter} the runtime adapters.
+
+% ---------------------------------------------------------------------------
+\section{Architecture}
+\label{sec:design:overview}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  blk/.style={draw=egblue, fill=eglight, rounded corners=2pt, align=center, font=\small, minimum height=1.0cm, minimum width=3.4cm},
+  io/.style={draw=eggray, rounded corners=2pt, align=center, font=\small, minimum height=0.8cm, minimum width=2.6cm},
+  outb/.style={draw=egorange, fill=egorange!8, rounded corners=2pt, align=center, font=\small, minimum height=1.0cm, minimum width=3.2cm},
+  arr/.style={-{Stealth}, eggray, thick}]
+\node[io] (w) at (0,0) {Weight tensors\\$\{L_i\}$ in DRAM};
+\node[io] (a) at (0,-2.6) {Per-layer INT8\\activations $\{\mathbf{a}_\ell\}$};
+\node[blk] (att) at (4.4,0) {\textbf{Attestation}\\Merkle verify + ECDSA};
+\node[blk] (mon) at (4.4,-2.6) {\textbf{Activation monitor}\\$Z_\ell$, $D_\ell$ per layer};
+\node[blk] (llm) at (4.4,-4.9) {\textbf{LLM scores}\\memorisation, entropy};
+\node[blk, minimum height=6.2cm, minimum width=2.6cm] (clf) at (8.8,-2.45) {\textbf{Threat}\\\textbf{classifier}\\priority\\rules};
+\node[outb] (res) at (12.4,-2.45) {Label, confidence,\\severity,\\explanation};
+\node[io, font=\scriptsize, minimum width=2.2cm] (ref) at (4.4,1.6) {signed root $(r,\sigma)$};
+\node[io, font=\scriptsize, minimum width=2.2cm] (cal) at (1.2,-4.0) {calibration\\$\boldsymbol\mu,\hat\Sigma$};
+\draw[arr] (w) -- (att);
+\draw[arr] (a) -- (mon);
+\draw[arr] (a.south) |- (llm.west);
+\draw[arr] (ref) -- (att);
+\draw[arr] (cal.east) -- ++(0.5,0) |- (mon.south west);
+\draw[arr] (att.east) -- node[above, font=\scriptsize]{$\mathcal{M}$} (att.east -| clf.west);
+\draw[arr] (mon.east) -- node[above, font=\scriptsize]{$\mathcal{A}$} (mon.east -| clf.west);
+\draw[arr] (llm.east) -- node[above, font=\scriptsize]{$s_{\text{mem}},H$} (llm.east -| clf.west);
+\draw[arr] (clf) -- (res);
+\end{tikzpicture}
+\caption{\textsc{EdgeGuard} runtime architecture. The two detectors are independent: attestation
+reads only weights; the monitor reads only activations. $\mathcal{M}$: tensors failing
+attestation; $\mathcal{A}$: anomalous layers; $s_{\text{mem}},H$: memorisation and entropy
+scores. The classifier fuses these outputs.}
+\label{fig:architecture}
+\end{figure}
+
+\Cref{fig:architecture} shows the runtime structure. Two detectors operate on disjoint inputs.
+Attestation reads only the weights and compares them with a signed reference. The activation
+monitor reads only the activations of the current inference and compares them with calibration
+statistics. A third, model-specific stage computes two scalar scores from late-layer
+activations. The classifier fuses the three outputs by priority rules into a single label with a
+confidence, a severity and an explanation.
+
+The separation is deliberate. Because the detectors share no inputs, an attacker who controls
+one input channel, say the prompt, cannot use it to influence the other detector's evidence.
+This is the basis of the complementarity argument in \cref{sec:design:complement}.
+
+The offline phase has two steps. The vendor builds and signs the Merkle tree
+(\cref{alg:build}), and the deployer calibrates the monitor on clean inputs
+(\cref{alg:calibrate}). Both produce small artefacts: a tree of $2n$ digests with one
+signature, and per-layer means and covariances.
+
+% ---------------------------------------------------------------------------
+\section{Weight attestation}
+\label{sec:design:merkle}
+
+\subsection{Leaf construction}
+
+Each weight tensor $L_i$ is hashed together with its shape:
+\begin{equation}
+  h_i = \Hash\big(\mathrm{enc}(\mathrm{shape}(L_i)) \,\|\, \mathrm{bytes}(L_i)\big),
+  \label{eq:leaf}
+\end{equation}
+where $\mathrm{enc}$ writes each dimension as a big-endian 64-bit integer and
+$\mathrm{bytes}$ is the row-major (C-order) byte serialisation. Including the shape means that
+two tensors with the same bytes but different shapes, for example a $64\times16$ and a
+$16\times64$ matrix, produce different leaves. Leaves are ordered by the model's tensor order,
+which for HuggingFace-style checkpoints is deterministic.
+
+\subsection{Tree construction and signing}
+
+\begin{algorithm}[t]
+\caption{\textsc{BuildAttestation}$(\{L_i\}_{i=0}^{n-1}, sk)$}
+\label{alg:build}
+\begin{algorithmic}[1]
+\State $\mathit{level} \gets [\,h_0,\dots,h_{n-1}\,]$ \Comment{leaves per \cref{eq:leaf}}
+\While{$|\mathit{level}| > 1$}
+  \If{$|\mathit{level}|$ is odd} append a copy of the last element \EndIf
+  \State $\mathit{level} \gets [\,\Hash(\mathit{level}[2j] \,\|\, \mathit{level}[2j{+}1]) : j = 0,\dots \,]$
+\EndWhile
+\State $r \gets \mathit{level}[0]$
+\State $\sigma \gets \textsc{ECDSA-Sign}_{P\text{-}256}(sk, r)$
+\State \Return $(r, \sigma, [h_0,\dots,h_{n-1}], n)$
+\end{algorithmic}
+\end{algorithm}
+
+\Cref{alg:build} builds the tree bottom-up, duplicating the last node of any odd level, and
+signs the root. The stored artefact consists of the root, the signature, the leaf digests, the
+leaf count $n$ and the public key.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  nd/.style={draw=eggray, rounded corners=1.5pt, minimum width=1.05cm, minimum height=0.55cm, font=\scriptsize},
+  bad/.style={nd, draw=egorange, fill=egorange!12, thick},
+  sib/.style={nd, draw=egblue, fill=eglight},
+  level distance=1.05cm]
+\foreach \i in {0,...,7} {
+  \ifnum\i=5 \node[bad] (l\i) at (\i*1.45,0) {$h_{\i}$};
+  \else\ifnum\i=4 \node[sib] (l\i) at (\i*1.45,0) {$h_{\i}$};
+  \else \node[nd] (l\i) at (\i*1.45,0) {$h_{\i}$}; \fi\fi
+  \node[font=\scriptsize, text=eggray] at (\i*1.45,-0.6) {$L_{\i}$};
+}
+\node[nd] (p0) at (0.725,1.1) {$h_{01}$};
+\node[nd] (p1) at (3.625,1.1) {$h_{23}$};
+\node[bad] (p2) at (6.525,1.1) {$h_{45}$};
+\node[sib] (p3) at (9.425,1.1) {$h_{67}$};
+\node[sib] (q0) at (2.175,2.2) {$h_{0..3}$};
+\node[bad] (q1) at (7.975,2.2) {$h_{4..7}$};
+\node[bad] (r) at (5.075,3.3) {$r$};
+\foreach \a/\b in {l0/p0,l1/p0,l2/p1,l3/p1,l4/p2,l5/p2,l6/p3,l7/p3,p0/q0,p1/q0,p2/q1,p3/q1,q0/r,q1/r}
+  \draw[eggray] (\a.north) -- (\b.south);
+\node[font=\scriptsize, align=left, anchor=west] at (11.0,2.2) {\textcolor{egorange!80!black}{$\blacksquare$} path changed by\\ \quad a flip in $L_5$\\[2pt]
+\textcolor{egblue}{$\blacksquare$} siblings in the\\ \quad proof for $L_5$};
+\end{tikzpicture}
+\caption{Merkle tree over eight weight tensors. A change in $L_5$ alters every node on its path
+to the root (orange). The membership proof for $L_5$ consists of the three sibling digests
+(blue), so a single tensor can be checked against the signed root with
+$\lceil\log_2 n\rceil$ extra hash evaluations.}
+\label{fig:merkle}
+\end{figure}
+
+\subsection{Verification and localisation}
+
+\begin{algorithm}[t]
+\caption{\textsc{Verify}$(\{L'_i\}, (r,\sigma,[h_i],n), pk)$}
+\label{alg:verify}
+\begin{algorithmic}[1]
+\Require $|\{L'_i\}| = n$ \Comment{leaf count is fixed by the reference}
+\State $\mathit{sig\_ok} \gets \textsc{ECDSA-Verify}(pk, r, \sigma)$
+\State $h'_i \gets$ leaf digest of $L'_i$ per \cref{eq:leaf}, for all $i$
+\State $r' \gets$ root of the tree over $[h'_0,\dots,h'_{n-1}]$ \Comment{\cref{alg:build}, lines 1--5}
+\If{$r' = r$} \Return $(\mathit{valid}=\mathit{sig\_ok}, \mathcal{M}=\emptyset)$ \EndIf
+\State $\mathcal{M} \gets \{\, i : h'_i \neq h_i \,\}$
+\State \Return $(\mathit{valid}=\textsf{false}, \mathcal{M})$
+\end{algorithmic}
+\end{algorithm}
+
+\Cref{alg:verify} recomputes every leaf, rebuilds the root and compares it with the signed root.
+If they differ, it compares leaves to find the modified tensors. The signature check confirms
+that the \emph{reference} is authentic. The root comparison confirms that the \emph{current
+weights} match the reference. Both must pass.
+
+\begin{proposition}[Integrity, G1]\label{prop:integrity}
+If the stored reference is authentic and $L'_i \neq L_i$ for some $i$ (in bytes or shape),
+\cref{alg:verify} returns $\mathit{valid}=\textsf{false}$, unless the attacker has found a
+SHA-256 second preimage.
+\end{proposition}
+\begin{proof}[Argument]
+If $L'_i\neq L_i$, the inputs to \cref{eq:leaf} differ, so $h'_i = h_i$ would be a second
+preimage. Hence $h'_i\neq h_i$. Now suppose $r'=r$. Walking up the path from leaf $i$, there is a
+first level at which the recomputed node equals the reference node while a child differs. At
+that node, two different 64-byte inputs have the same SHA-256 digest, which is a collision.
+Hence $r'\neq r$ and the algorithm returns \textsf{false}.
+\end{proof}
+
+\begin{proposition}[Exact localisation, G2]\label{prop:localise}
+Under the same assumption, the set $\mathcal{M}$ returned by \cref{alg:verify} equals
+$\{i : L'_i \neq L_i\}$.
+\end{proposition}
+\begin{proof}[Argument]
+$\mathcal{M}$ is computed by direct comparison of each fresh leaf with its stored counterpart.
+By the first step of the previous argument, $h'_i\neq h_i$ if and only if $L'_i\neq L_i$, unless
+a second preimage exists.
+\end{proof}
+
+\begin{remark}[Duplicate-leaf padding]\label{rem:padding}
+Padding an odd level with a copy of its last node means that the leaf lists $[h_0,\dots,h_{k}]$
+and $[h_0,\dots,h_{k},h_{k}]$ can yield the same root. This is the root of a known weakness in
+some Merkle-tree implementations. \Cref{alg:verify} is not affected because it requires the
+fresh leaf count to equal the signed $n$ and it compares leaves individually. Any variant that
+accepts a variable number of tensors must, however, either sign $n$ together with $r$ or use
+distinct domain-separation prefixes for leaves, internal nodes and padding. The current
+implementation relies on the fixed count. Adding domain separation is listed as future work.
+\end{remark}
+
+\paragraph{Cost.} Verification is dominated by hashing every byte of every tensor, so its cost is
+$\Theta(\sum_i |L_i|)$ regardless of the tree. The tree adds $n-1$ internal hashes, which are
+negligible, and leaf comparison costs $O(n)$ digest comparisons. The value of the tree structure is
+therefore \emph{not} faster full verification. Its value is that any single tensor can be checked
+against the signed root with a proof of $\lceil\log_2 n\rceil$ digests, without re-hashing the
+others. This enables the amortised schemes in \cref{sec:disc:amortise}, which are needed because
+full verification of language-model-sized weights is too slow to run on every inference
+(\cref{sec:eval:merkle}). The current implementation generates inclusion proofs (\code{MerkleTree.get\_proof}) but does
+not yet include a stand-alone proof verifier or a partial-verification mode. Both are planned
+(\cref{ch:conclusion}).
+
+% ---------------------------------------------------------------------------
+\section{INT8 activation monitor}
+\label{sec:design:monitor}
+
+\subsection{Calibration}
+
+\begin{algorithm}[t]
+\caption{\textsc{Calibrate}$(\{\mathbf{a}_{\ell,t}\}, d_{\max})$}
+\label{alg:calibrate}
+\begin{algorithmic}[1]
+\For{each monitored layer $\ell$}
+  \State $t \gets 0$; $\boldsymbol\mu \gets \mathbf{0}$; $M \gets \mathbf{0}$
+  \For{each clean sample $\mathbf{a}_{\ell,t}$} \Comment{INT8 values, cast to float64 for accumulation}
+    \State $t \gets t+1$; $\boldsymbol\delta \gets \mathbf{a}_{\ell,t} - \boldsymbol\mu$; $\boldsymbol\mu \gets \boldsymbol\mu + \boldsymbol\delta/t$
+    \State $M \gets M + \boldsymbol\delta(\mathbf{a}_{\ell,t}-\boldsymbol\mu)^\top$ \Comment{diagonal only if $d_\ell > d_{\max}$}
+  \EndFor
+  \State $\hat\Sigma_\ell \gets M/(t-1)$; $\boldsymbol\sigma_\ell \gets \sqrt{\mathrm{diag}(\hat\Sigma_\ell)}$
+  \State $\hat\Sigma_\ell^{+} \gets \textsc{PseudoInverse}(\hat\Sigma_\ell)$ if $d_\ell \le d_{\max}$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\Cref{alg:calibrate} applies Welford's update \cref{eq:welford} to each monitored layer. The
+activations are the INT8 values the runtime produces, so the statistics are in the same units
+that are seen at inference time. For layers wider than $d_{\max}$ (default 512), only the
+diagonal is kept, because a dense covariance costs $O(d^2)$ memory: 1\,MiB for $d=512$ at double
+precision, but 128\,MiB for $d=4096$. The pseudo-inverse uses an eigendecomposition for symmetric
+matrices (\code{scipy.linalg.pinvh}), which tolerates the singular covariances that arise when
+some channels are constant or perfectly correlated.
+
+\subsection{Scoring and decision}
+
+For each monitored layer $\ell$ and test activation $\mathbf{a}_\ell$, the monitor computes
+\begin{equation}
+  Z_\ell = \max_j \frac{|a_{\ell,j}-\mu_{\ell,j}|}{\sigma_{\ell,j}+\epsilon},
+  \qquad
+  D_\ell = \sqrt{(\mathbf{a}_\ell-\boldsymbol\mu_\ell)^\top\hat\Sigma_\ell^{+}(\mathbf{a}_\ell-\boldsymbol\mu_\ell)},
+  \label{eq:scores}
+\end{equation}
+with $D_\ell$ falling back to $Z_\ell$ when no covariance is stored. A layer is \emph{anomalous}
+if $Z_\ell>\tau_z$ \emph{or} $D_\ell>\tau_D$. The input is anomalous if any layer is. The
+implementation also reports a weighted combination of normalised $Z_\ell$ and $D_\ell$ for use in
+explanations, but the decision uses the two thresholds directly.
+
+\subsection{Choosing the thresholds}
+\label{sec:design:threshold}
+
+The $z$ statistic is a maximum over $d_\ell$ channels, and the input-level decision is a further
+maximum over layers. The effective number of comparisons is therefore $m=\sum_\ell d_\ell$, and a
+per-channel threshold that would be conservative in isolation produces a substantial input-level
+false-positive rate by \cref{eq:fwer}. The design offers two ways to set $\tau_z$:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Bonferroni:} $\tau_z = z^*(\alpha)$ from \cref{eq:bonf}, for a target input-level
+        false-positive rate $\alpha$. This needs only $m$.
+  \item \textbf{Empirical:} $\tau_z$ is the $(1-\alpha)$ quantile of the input-level maximum
+        $\max_\ell Z_\ell$ on a held-out clean set. This adapts to correlation and non-Gaussian
+        tails but needs enough held-out data to estimate a tail quantile.
+\end{enumerate}
+
+\Cref{sec:eval:fpr} shows that the Bonferroni threshold achieves close to its target on the
+evaluation data. The fixed default of $\tau_z=4$ used in the main experiments was chosen before
+this analysis and is retained so that its effect can be reported.
+
+% ---------------------------------------------------------------------------
+\section{Threat classifier}
+\label{sec:design:classifier}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  dec/.style={draw=eggray, diamond, aspect=2.4, align=center, font=\scriptsize, inner sep=1pt},
+  lab/.style={draw=egorange, fill=egorange!8, rounded corners=2pt, align=center, font=\scriptsize, minimum width=2.4cm, minimum height=0.6cm},
+  arr/.style={-{Stealth}, eggray},
+  node distance=0.5cm]
+\node[dec] (d1) {$\mathcal{M}\neq\emptyset$?};
+\node[dec, below=0.55cm of d1] (d2) {$s_{\text{mem}}>\theta_m$?};
+\node[dec, below=0.95cm of d2] (d3) {$H<\theta_H$?};
+\node[dec, below=0.95cm of d3] (d4) {$\mathcal{A}\neq\emptyset$?};
+\node[dec, right=1.2cm of d1] (d1b) {$|\mathcal{M}|>0.3n$?};
+\node[lab, right=0.9cm of d1b, yshift=0.45cm] (sc) {SUPPLY\_CHAIN\_BACKDOOR};
+\node[lab, right=0.9cm of d1b, yshift=-0.45cm] (wt) {WEIGHT\_TAMPER};
+\node[lab, right=4.4cm of d2] (ex) {TRAINING\_DATA\_EXFILTRATION};
+\node[dec, right=1.2cm of d3] (d3b) {base label\\$=$ ADV?};
+\node[lab, right=0.9cm of d3b, yshift=0.45cm] (jb) {JAILBREAK};
+\node[lab, right=0.9cm of d3b, yshift=-0.45cm] (pi) {PROMPT\_INJECTION};
+\node[dec, right=1.2cm of d4] (d4b) {early share\\$\ge 0.5$?};
+\node[lab, right=0.9cm of d4b, yshift=0.45cm] (adv) {ADVERSARIAL\_INPUT};
+\node[lab, right=0.9cm of d4b, yshift=-0.45cm] (tf) {TRANSIENT\_FAULT};
+\node[lab, below=0.55cm of d4] (cl) {CLEAN};
+\draw[arr] (d1) -- node[left, font=\tiny]{no} (d2);
+\draw[arr] (d2) -- node[left, font=\tiny]{no} (d3);
+\draw[arr] (d3) -- node[left, font=\tiny]{no} (d4);
+\draw[arr] (d4) -- node[left, font=\tiny]{no} (cl);
+\draw[arr] (d1) -- node[above, font=\tiny]{yes} (d1b);
+\draw[arr] (d1b.east) -- node[above, font=\tiny]{yes} (sc.west);
+\draw[arr] (d1b.east) -- node[below, font=\tiny]{no} (wt.west);
+\draw[arr] (d2) -- node[above, font=\tiny]{yes} (ex);
+\draw[arr] (d3) -- node[above, font=\tiny]{yes} (d3b);
+\draw[arr] (d3b.east) -- node[above, font=\tiny]{yes} (jb.west);
+\draw[arr] (d3b.east) -- node[below, font=\tiny]{no} (pi.west);
+\draw[arr] (d4) -- node[above, font=\tiny]{yes} (d4b);
+\draw[arr] (d4b.east) -- node[above, font=\tiny]{yes} (adv.west);
+\draw[arr] (d4b.east) -- node[below, font=\tiny]{no} (tf.west);
+\end{tikzpicture}
+\caption{Priority decision procedure of the language-model threat classifier. $\mathcal{M}$:
+tensors failing attestation; $s_{\text{mem}}$: memorisation score; $H$: late-layer entropy;
+$\mathcal{A}$: anomalous layers; ``early share'': fraction of anomalous layers lying in the first
+40\% of the model.}
+\label{fig:classifier}
+\end{figure}
+
+\Cref{fig:classifier} gives the decision procedure. Its order encodes a judgement about
+evidence strength. A hash mismatch is cryptographic evidence and takes precedence over
+everything. The model-specific scores come next. Generic activation anomalies come last, and
+their placement within the network decides between an input-borne attack and a fault.
+
+\paragraph{Weight evidence.} Any attestation failure produces WEIGHT\_TAMPER, upgraded to
+SUPPLY\_CHAIN\_BACKDOOR when more than 30\% of tensors are affected. The rationale is that a
+runtime bit-flip attack touches a handful of bits, whereas a replaced or re-poisoned checkpoint
+changes many tensors. The heuristic is inherently weak. A supply-chain attacker who modifies a
+single tensor is indistinguishable, from the weights alone, from a runtime flip in that tensor.
+\Cref{sec:eval:labels} shows this happening.
+
+\paragraph{Activation evidence.} With intact weights, an anomaly concentrated in early layers is
+labelled an adversarial input, on the reasoning that crafted inputs perturb the earliest
+representations. An anomaly concentrated in late layers is labelled a transient fault, for
+example a soft error in on-chip SRAM. The split uses the fraction of \emph{anomalous} layers
+that are early, compared against 0.5, with ``early'' meaning the first 40\% of layers. One
+consequence is worth noting before the evaluation. If every layer is anomalous, the early share
+is 0.4 and the label is TRANSIENT\_FAULT, even for an input attack. A rule that compared the
+\emph{rate} of anomalies among early layers with the rate among late layers would not have this
+bias. The issue is examined with data in \cref{sec:eval:labels}.
+
+\paragraph{Confidence and severity.} Each label carries a heuristic confidence: 0.90 plus a small
+increase with the fraction of tampered tensors for weight tampering, a value rising with the
+early share and the peak $z$ for adversarial inputs, and so on. These are ranking aids for
+operators, not calibrated probabilities. Severity is a fixed mapping from label to
+\{none, low, medium, high, critical\}, downgraded to medium when confidence is below 0.5.
+
+% ---------------------------------------------------------------------------
+\section{Language-model-specific scores}
+\label{sec:design:llm}
+
+Two scalar scores are computed over the late layers $\mathcal{L}$ (the last 60\% of
+tensors in model order). Both are defined exactly as implemented.
+
+\paragraph{Memorisation score.} For each late layer, with mean absolute activation $\bar a$ and
+standard deviation $s$,
+\begin{equation}
+  s_\ell = \min\!\Big(1,\; \frac{\bar a}{50}\cdot\frac{1}{1+s/5}\Big),
+  \qquad s_{\text{mem}} = \frac{1}{|\mathcal{L}|}\sum_{\ell\in\mathcal{L}} s_\ell ,
+  \label{eq:mem}
+\end{equation}
+with $s_\ell=1$ if $s=0$. The score is high when late activations are large and nearly
+constant, which is the signature the extraction-probe simulator assumes. The constants 50 and 5
+are scale choices for INT8 activations near the calibration distribution used here (mean 10,
+standard deviation 5). They are not derived from a real model and would need re-fitting.
+
+\paragraph{Late-layer entropy.} For each late layer, a softmax with a data-dependent temperature
+is applied to the activation vector,
+\begin{equation}
+  p_j \propto \exp\!\Big(\frac{a_j - \max_k a_k}{\max(\overline{|a - \max a|},\,1)}\Big),
+  \qquad
+  H_\ell = -\frac{\sum_j p_j\log p_j}{\log d},
+  \label{eq:entropy}
+\end{equation}
+and $H$ is the mean of $H_\ell$ over late layers. Values near 1 indicate diffuse activations;
+values near 0 indicate a few dominant channels. Because the temperature is the mean deviation
+from the maximum, the score is invariant to adding a constant to every channel and to
+multiplying every channel by a positive constant. Shifting or uniformly narrowing a layer's
+activations therefore cannot lower it, which matters in \cref{sec:eval:labels}.
+
+\paragraph{Thresholds.} The evaluation uses $\theta_m=0.55$ and $\theta_H=0.30$.
+
+\paragraph{Unreachable labels.} The label set defines WEIGHT\_THEFT\_PROBE and UNKNOWN, but the
+decision procedure in \cref{fig:classifier} never returns them. They are kept as placeholders for
+future rules. The classifier therefore has eight reachable labels, and all results are reported
+over those eight.
+
+% ---------------------------------------------------------------------------
+\section{Complementarity of the two detectors}
+\label{sec:design:complement}
+
+The design argument for combining attestation with activation monitoring can be stated
+precisely. Let $E_W$ be the event that weights are modified, and $E_X$ the event that the
+current input is adversarial. Attestation detects $E_W$ with certainty under
+\cref{prop:integrity}, independently of the input. The monitor detects an input when its
+activations leave the calibration region, whatever the cause. A synergy attacker realises $E_W$
+and chooses the input to keep the activations inside the calibration region. Against the monitor
+alone, such an attacker can succeed by construction if the input space is rich enough. Against the
+combination, the attacker must defeat attestation, which requires a hash collision or a
+compromise of the verifier, both excluded by the threat model. The combination therefore turns a
+statistical game that the attacker can win into a cryptographic one that the attacker cannot.
+
+The argument has a limit. It holds only at verification time. A flip made after verification
+and before the next one is invisible to attestation during that window (\cref{sec:disc:toctou}).
+
+% ---------------------------------------------------------------------------
+\section{Explanations}
+\label{sec:design:explain}
+
+Each result carries a plain-text explanation assembled from the same quantities used for the
+decision. Nothing is generated by a separate model. The following explanation was produced for a
+simulated sign-bit flip in the tiny profile. It is reproduced from the implementation's output,
+with a check-mark glyph before ``valid'' omitted:
+
+\begin{lstlisting}[language={},numbers=none,frame=single]
+LLM THREAT: WEIGHT_TAMPER
+  Base classification: WEIGHT_TAMPER (conf=0.91)
+  Memorization probe score: 0.099 (threshold=0.55)
+  Late-layer entropy: 0.965 (threshold=0.3)
+  Tampered layers: ['model.layers.0.mlp.gate_proj.weight']
+  Merkle root signature: valid
+\end{lstlisting}
+
+The last line reports that the \emph{reference} root's signature verified, not that the weights
+are intact. The wording could mislead an operator, and changing it to ``reference signature
+valid; current weights do NOT match'' is a small usability fix recorded in
+\cref{ch:conclusion}. For an activation-only detection, the explanation lists the anomalous
+layers with their $Z_\ell$ and $D_\ell$ values next to the thresholds, so that an analyst can
+see how far each layer exceeded its threshold.
+
+% ---------------------------------------------------------------------------
+\section{Runtime adapters}
+\label{sec:design:adapter}
+
+\paragraph{PyTorch.} For development, activations are captured with forward hooks registered on
+named modules. A context manager installs and removes the hooks and collects one activation
+tensor per module per call.
+
+\paragraph{QNN.} For an NPU deployment, the adapter is defined against a minimal protocol rather
+than the vendor SDK, so that it can be tested without hardware:
+
+\begin{lstlisting}
+class QNNGraph(Protocol):
+    def execute(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]: ...
+    def get_layer_names(self) -> list[str]: ...
+    def get_intermediate_outputs(self, layer: str) -> np.ndarray: ...
+\end{lstlisting}
+
+A configuration maps each monitored \textsc{EdgeGuard} layer name to one or more graph node
+names, and an option clips values to the INT8 range. A concrete implementation over the QNN C
+API would expose the chosen intermediate tensors as additional graph outputs when the context
+binary is built. Writing that implementation and measuring its overhead on a device is the main
+engineering task of the next phase.

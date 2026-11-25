@@ -1,0 +1,19 @@
+{
+ "m_channels": 1248,
+ "p_single_z4": 6.334248366623996e-05,
+ "predicted_fpr_z4": 0.07600990156547949,
+ "empirical_fpr_z4": 0.072,
+ "alpha": 0.01,
+ "z_bonferroni": 4.464841080084617,
+ "empirical_fpr_bonf": 0.009,
+ "tpr_at_bonf": {
+  "ADV_TEXT_INJECTION": 1.0,
+  "ADV_SAFETY_BYPASS": 1.0,
+  "EXFIL_PROBE": 1.0,
+  "SYNERGY": 0.004,
+  "CLEAN": 0.009
+ },
+ "clean_max_z_mean": 3.475384172145652,
+ "clean_max_z_p99": 4.451474698885628,
+ "expected_max_gaussian": 3.3523515340195007
+}

@@ -159,10 +159,11 @@ class WeightExtractionAttack:
         flat = noisy.flatten()
 
         if self.attack_type == "cold_boot":
-            # DRAM decay: random bit flips
-            for i in indices:
-                bit = int(self.rng.integers(0, 8))
-                flat[i] = int(flat[i]) ^ (1 << bit)
+            # DRAM decay: random bit flips on the stored two's-complement byte
+            raw = flat.astype(np.int8).view(np.uint8)
+            bits = self.rng.integers(0, 8, size=len(indices)).astype(np.uint8)
+            raw[indices] ^= (np.uint8(1) << bits)
+            flat = raw.view(np.int8).astype(np.int32)
         elif self.attack_type == "em_side_channel":
             # Quantization ambiguity: ±1 step error
             noise = self.rng.choice([-1, 0, 1], size=len(indices))

@@ -1,0 +1,294 @@
+\chapter{Background}
+\label{ch:background}
+
+This chapter collects the material that later chapters rely on. \Cref{sec:bg:quant} reviews
+integer quantization and the effect of a single bit flip on an INT8 weight.
+\Cref{sec:bg:npu} outlines the software stack through which a quantized model reaches a
+Qualcomm NPU. \Cref{sec:bg:transformer} describes the weight layout of a decoder-only
+transformer. \Cref{sec:bg:crypto} reviews the cryptographic primitives used for attestation,
+and \cref{sec:bg:stats} the statistics used by the activation monitor.
+
+% ---------------------------------------------------------------------------
+\section{Integer quantization}
+\label{sec:bg:quant}
+
+\subsection{Affine and symmetric quantization}
+
+Quantization maps a real-valued tensor $x$ to integers $q$ using a scale $s>0$ and a zero
+point $z_0$ \cite{jacob2018quantization,nagel2021whitepaper}:
+\begin{equation}
+  q = \clamp\!\Big(\round\big(x/s\big) + z_0,\; q_{\min},\; q_{\max}\Big),
+  \qquad \hat x = s\,(q - z_0).
+  \label{eq:affine}
+\end{equation}
+For signed 8-bit storage, $q_{\min}=-128$ and $q_{\max}=127$. \emph{Symmetric} quantization
+fixes $z_0=0$ and chooses $s = \max|x| / 127$, so that the largest-magnitude value maps to
+$\pm127$. \emph{Asymmetric} quantization uses unsigned storage $[0,255]$ with
+$s=(x_{\max}-x_{\min})/255$ and $z_0 = \round(-x_{\min}/s)$, which uses the full range
+when the distribution is skewed. \textsc{EdgeGuard}'s helper \code{compute\_int8\_params}
+implements both variants per tensor (\cref{ch:implementation}).
+
+The reconstruction error of a value inside the clipping range is at most $s/2$. Rounding errors
+are commonly modelled as uniform on $[-s/2,s/2]$ with variance $s^2/12$. This matters for the
+monitor in two ways. Activations observed at runtime are integers, so their empirical variance
+includes this quantization noise. And statistics computed in FP32 at calibration time and
+compared against INT8 values at runtime would be measured in different units unless they are
+rescaled. Calibrating directly on the INT8 values avoids this mismatch by construction.
+
+\subsection{Per-tensor, per-channel and low-bit formats}
+
+A single scale per tensor is simple but wastes resolution when channel magnitudes differ.
+Per-channel quantization assigns a scale to each output channel of a weight matrix and is the
+usual choice for convolution and linear weights \cite{nagel2021whitepaper}. Below eight bits,
+formats such as INT4 pack two values per byte. \textsc{EdgeGuard} stores INT4 values in the
+low and high nibbles of a byte and sign-extends them on unpacking. The attestation layer is
+indifferent to these choices because it hashes the stored bytes, whatever they encode.
+
+For LLMs, activation outliers make naive 8-bit activation quantization lossy. SmoothQuant
+migrates part of the activation range into the weights with a mathematically equivalent
+per-channel rescaling, enabling 8-bit weights and activations for models up to 530B parameters
+\cite{xiao2023smoothquant}. GPTQ quantizes weights to 3--4 bits using approximate second-order
+information \cite{frantar2023gptq}. Both produce integer tensors of the kind that
+\textsc{EdgeGuard} attests.
+
+\subsection{Two's complement and the cost of one bit}
+\label{sec:bg:twos}
+
+An INT8 value is stored as a byte $b_7b_6\dots b_0$ in two's complement:
+\begin{equation}
+  q = -128\,b_7 + \sum_{k=0}^{6} 2^k b_k .
+\end{equation}
+Flipping bit $k<7$ changes $q$ by exactly $\pm 2^k$. Flipping the sign bit $b_7$ changes $q$ by
+$\pm128$ when interpreted in the signed range: for instance $-5$ (\code{0xFB}) becomes $123$
+(\code{0x7B}), a change of $128$. In real units the change is $s\cdot 2^k$, so the
+maximum single-flip perturbation of a weight is $128\,s$. \Cref{tab:bitflip_effect}
+summarises the effect by bit position.
+
+\begin{table}[t]
+\centering
+\caption{Effect of flipping one bit of an INT8 weight stored in two's complement.}
+\label{tab:bitflip_effect}
+\begin{tabular}{cccl}
+\toprule
+\textbf{Bit $k$} & \textbf{$|\Delta q|$} & \textbf{$|\Delta \hat x|$} & \textbf{Example ($q=-5$)} \\
+\midrule
+0 (LSB) & 1   & $s$     & $-5 \to -6$ \\
+1       & 2   & $2s$    & $-5 \to -7$ \\
+2       & 4   & $4s$    & $-5 \to -1$ \\
+3       & 8   & $8s$    & $-5 \to -13$ \\
+4       & 16  & $16s$   & $-5 \to -21$ \\
+5       & 32  & $32s$   & $-5 \to -37$ \\
+6       & 64  & $64s$   & $-5 \to -69$ \\
+7 (sign)& 128 & $128s$  & $-5 \to 123$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A subtle implementation point follows from this arithmetic. In a high-level language, XORing a
+\emph{signed} integer with $2^7$ does not reproduce the hardware effect. In Python,
+\code{-5 \^{} 128} evaluates to $-133$, which is outside the INT8 range and either raises an
+overflow error or, if clipped, saturates to $-128$ instead of wrapping to $123$. A faithful
+simulator must operate on the unsigned byte view. Two such errors were found in the original
+\textsc{EdgeGuard} simulators and are described in \cref{sec:impl:bugs}.
+
+% ---------------------------------------------------------------------------
+\section{The edge NPU software stack}
+\label{sec:bg:npu}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw=eggray, rounded corners=2pt, minimum width=10.5cm, minimum height=0.8cm,
+              align=center, font=\small},
+  hl/.style={box, fill=eglight, draw=egblue},
+  node distance=0.18cm]
+\node[box] (app) {Application (Android / Linux process)};
+\node[box, below=of app] (fw) {Framework delegate: LiteRT, ONNX Runtime, ExecuTorch};
+\node[hl, below=of fw] (qnn) {Qualcomm AI Engine Direct (QNN) API: backend, context, graph};
+\node[box, below=of qnn, minimum width=3.3cm, xshift=-3.6cm] (cpu) {CPU backend};
+\node[box, right=0.15cm of cpu, minimum width=3.3cm] (gpu) {GPU backend};
+\node[box, right=0.15cm of gpu, minimum width=3.6cm, fill=eglight, draw=egblue] (htp) {HTP backend (NPU)};
+\node[box, below=0.18cm of gpu, minimum width=10.5cm] (dram) {Shared DRAM: weights, activations, context binary};
+\draw[-{Stealth}, eggray] (app) -- (fw);
+\draw[-{Stealth}, eggray] (fw) -- (qnn);
+\draw[-{Stealth}, eggray] (qnn.south) ++(-3.6,0) -- (cpu.north);
+\draw[-{Stealth}, eggray] (qnn.south) -- (gpu.north);
+\draw[-{Stealth}, eggray] (qnn.south) ++(3.45,0) -- (htp.north);
+\node[right=0.3cm of dram, font=\scriptsize, text=egorange!80!black, align=left] {Rowhammer,\\cold boot};
+\end{tikzpicture}
+\caption{Simplified software stack for a quantized model on a Snapdragon device. The weights
+that the NPU executes reside in DRAM shared with the rest of the system.}
+\label{fig:npu_stack}
+\end{figure}
+
+Qualcomm's AI Engine Direct SDK, also referred to as QNN, provides a low-level API over the
+Kryo CPU, Adreno GPU and Hexagon NPU, organised around tools, devices, backends, contexts,
+graphs and an operation-package registry \cite{qualcomm_qnn}. Each processing unit is driven by a
+\emph{backend} library; the HTP backend targets the Hexagon processor with its fused AI
+accelerator \cite{qualcomm_qnn_backend}. Higher-level frameworks delegate to these backends.
+ExecuTorch, for example, lowers PyTorch models to a QNN context binary for the HTP backend
+\cite{executorch_qnn}.
+
+Two properties of this stack matter here. First, the weights an NPU executes are stored in
+system DRAM, which is shared with other software and exposed to DRAM-level attacks
+(\cref{fig:npu_stack}). Second, the runtime is optimised for throughput and exposes inputs and
+outputs, not intermediate activations, by default. Obtaining per-layer activations for
+monitoring therefore requires either marking intermediate tensors as graph outputs at
+compilation time or running an instrumented copy of the graph. \textsc{EdgeGuard}'s QNN adapter
+is designed around the first option (\cref{sec:design:adapter}).
+
+% ---------------------------------------------------------------------------
+\section{Decoder-only transformer weight layout}
+\label{sec:bg:transformer}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  w/.style={draw=egblue, fill=eglight, rounded corners=1.5pt, minimum height=0.55cm,
+            font=\scriptsize\ttfamily, inner sep=2pt},
+  n/.style={draw=eggray, rounded corners=1.5pt, minimum height=0.55cm, font=\scriptsize\ttfamily, inner sep=2pt},
+  lab/.style={font=\scriptsize, text=eggray}]
+\node[w, minimum width=4.2cm] (emb) at (0,0) {embed\_tokens  $V\times H$};
+\begin{scope}[yshift=-1.0cm]
+\node[n, minimum width=4.2cm] (ln1) at (0,0) {input\_layernorm  $H$};
+\node[w, minimum width=2.0cm, anchor=north west] (q) at ($(ln1.south west)+(0,-0.15)$) {q\_proj $H\!\times\! H$};
+\node[w, minimum width=2.0cm, anchor=north east] (k) at ($(ln1.south east)+(0,-0.15)$) {k\_proj $H\!\times\! d_h$};
+\node[w, minimum width=2.0cm, anchor=north] (v) at ($(q.south)+(0,-0.15)$) {v\_proj $H\!\times\! d_h$};
+\node[w, minimum width=2.0cm, anchor=north] (o) at ($(k.south)+(0,-0.15)$) {o\_proj $H\!\times\! H$};
+\node[n, minimum width=4.2cm, anchor=north] (ln2) at ($(ln1.south)+(0,-1.6)$) {post\_attention\_layernorm $H$};
+\node[w, minimum width=2.0cm, anchor=north west] (g) at ($(ln2.south west)+(0,-0.15)$) {gate\_proj $I\!\times\! H$};
+\node[w, minimum width=2.0cm, anchor=north east] (u) at ($(ln2.south east)+(0,-0.15)$) {up\_proj $I\!\times\! H$};
+\node[w, minimum width=4.2cm, anchor=north] (d) at ($(ln2.south)+(0,-0.85)$) {down\_proj $H\times I$};
+\node[draw=eggray, dashed, rounded corners=3pt, inner sep=5pt, fit=(ln1)(q)(k)(v)(o)(ln2)(g)(u)(d)] (blk) {};
+\node[lab, anchor=west] at (blk.east) {$\times\,N$ blocks (9 tensors each)};
+\end{scope}
+\node[n, minimum width=4.2cm, below=0.45cm of blk] (norm) {model.norm  $H$};
+\node[w, minimum width=4.2cm, below=0.15cm of norm] (head) {lm\_head  $V\times H$};
+\end{tikzpicture}
+\caption{Weight tensors of the decoder-only transformer layout used by
+\code{QuantizedTransformerStub}, with HuggingFace-style names. Shaded tensors are
+matrices; outlined tensors are normalisation vectors. Grouped-query attention is represented by
+the smaller key and value projections.}
+\label{fig:transformer_layout}
+\end{figure}
+
+Llama~3, Qwen2.5 and Phi-3 are decoder-only transformers \cite{vaswani2017attention,
+llama3herd,qwen25report,phi3report}. Each block applies RMS normalisation, multi-head
+self-attention with query, key, value and output projections, a second normalisation and a
+SwiGLU feed-forward network with gate, up and down projections. A token embedding matrix
+precedes the blocks; a final normalisation and an output projection (``LM head'') follow them.
+
+\textsc{EdgeGuard}'s \code{QuantizedTransformerStub} generates INT8 tensors with this layout
+(\cref{fig:transformer_layout}). For hidden size $H$, feed-forward size $I$, key/value
+projection width $d_h$, vocabulary $V$ and $N$ blocks, the stub has $9N+3$ tensors and
+\begin{equation}
+  P_{\text{stub}} = 2VH + N\big(2H^2 + 2Hd_h + 3HI + 2H\big) + H
+  \label{eq:stub_params}
+\end{equation}
+parameters. The stub is a structural model, not a replica. It always uses a separate LM head
+(some of the real models tie it to the embedding), sets the key/value width to a single head
+dimension, and stores normalisation weights as INT8. Its parameter counts therefore differ from
+the published model sizes, and this report always labels them as \emph{stub} counts.
+\Cref{tab:profiles} lists the five profiles.
+
+\begin{table}[t]
+\centering
+\caption{Stub profiles. Dimensions follow the named models; parameter counts are those of the
+stub per \cref{eq:stub_params} and are \emph{not} the official model sizes.}
+\label{tab:profiles}
+\small
+\input{../generated/tab_profiles.tex}
+\end{table}
+
+% ---------------------------------------------------------------------------
+\section{Cryptographic primitives}
+\label{sec:bg:crypto}
+
+\subsection{SHA-256}
+SHA-256 is specified in FIPS~180-4 \cite{fips180-4}. It maps a message of arbitrary length to a
+256-bit digest. The properties relied on here are collision resistance (it is infeasible to
+find $x\neq x'$ with $\Hash(x)=\Hash(x')$) and second-preimage resistance (given $x$, it is
+infeasible to find $x'\neq x$ with the same digest). No practical attack on either property is
+known for SHA-256. Hashing is fast on commodity CPUs. On the evaluation machine, the
+implementation in \cref{ch:implementation} achieved roughly \MerkThrMin{}--\MerkThrMax{}\,MiB/s over
+weight tensors.
+
+\subsection{Merkle trees}
+A Merkle tree \cite{merkle1987digital} commits to an ordered list of values with a single
+digest. Leaves are digests of the values, and each internal node is the digest of the
+concatenation of its two children. The root commits to every leaf: changing any leaf changes
+the root unless a collision is found. A membership proof for one leaf consists of the
+$\lceil\log_2 n\rceil$ sibling digests on its path to the root. Merkle trees are used in
+certificate transparency, version-control systems and blockchains, and they have a known
+pitfall that is relevant to this project. If an odd node is paired with a copy of itself, two
+different leaf lists can produce the same root, for example $[a,b,c]$ and $[a,b,c,c]$. The
+pitfall is harmless here only because the verifier fixes the number of leaves; this point is
+taken up in \cref{sec:design:merkle}.
+
+\subsection{ECDSA over P-256}
+The root is signed with the Elliptic Curve Digital Signature Algorithm on the NIST P-256 curve,
+as specified in FIPS~186-5 \cite{fips186-5}. A signature over the 32-byte root lets a verifier
+holding only the public key confirm that the root was produced by the holder of the private
+key. In a deployment, the public key and the verification code would sit in a trusted
+component, such as a TEE or a secure boot chain, so that an attacker who can rewrite DRAM
+cannot also rewrite the reference.
+
+% ---------------------------------------------------------------------------
+\section{Statistics for the activation monitor}
+\label{sec:bg:stats}
+
+\subsection{Streaming mean and covariance}
+Calibration observes $T$ activation vectors $\mathbf{a}_1,\dots,\mathbf{a}_T\in\R^d$ per
+monitored layer. Storing them all is wasteful, and the na\"\i ve one-pass formula
+$\frac1T\sum a^2 - (\frac1T\sum a)^2$ loses precision through cancellation. Welford's method
+\cite{welford1962note} updates the mean and the sum of centred outer products incrementally:
+\begin{align}
+  \boldsymbol\delta_t &= \mathbf{a}_t - \boldsymbol\mu_{t-1}, &
+  \boldsymbol\mu_t &= \boldsymbol\mu_{t-1} + \boldsymbol\delta_t / t, &
+  M_t &= M_{t-1} + \boldsymbol\delta_t\,(\mathbf{a}_t - \boldsymbol\mu_t)^{\top},
+  \label{eq:welford}
+\end{align}
+with $\hat\Sigma = M_T/(T-1)$. Each update costs $O(d^2)$ time and the state occupies $O(d^2)$
+memory, independent of $T$.
+
+\subsection{$z$-scores and the Mahalanobis distance}
+For a new vector $\mathbf{a}$, the per-channel standard score is
+$z_j = (a_j - \mu_j)/(\sigma_j+\epsilon)$. The Mahalanobis distance \cite{mahalanobis1936}
+\begin{equation}
+  D(\mathbf{a}) = \sqrt{(\mathbf{a}-\boldsymbol\mu)^\top \hat\Sigma^{+} (\mathbf{a}-\boldsymbol\mu)}
+  \label{eq:mahal_bg}
+\end{equation}
+accounts for correlation between channels. Under a Gaussian model, $D^2$ follows a
+$\chi^2_d$ distribution. Lee et al.\ used class-conditional Mahalanobis distances on hidden
+features to detect out-of-distribution and adversarial inputs \cite{lee2018simple}. Using the
+pseudo-inverse $\hat\Sigma^{+}$ keeps the computation defined when the covariance is singular,
+which is common for INT8 activations because of repeated values.
+
+\subsection{Multiple comparisons}
+\label{sec:bg:multiple}
+The monitor flags an input if \emph{any} of $m$ monitored channels exceeds a threshold. If each
+channel exceeds a two-sided threshold $\tau$ with probability $p(\tau)=2(1-\Phi(\tau))$ on clean
+data, and channels are independent, the probability that a clean input is flagged is
+\begin{equation}
+  \mathrm{FPR}(\tau) = 1 - \big(1 - p(\tau)\big)^{m}.
+  \label{eq:fwer}
+\end{equation}
+This is the family-wise error rate familiar from multiple hypothesis testing. For $\tau=4$,
+$p\approx\PSingleZFour$, which looks negligible for one channel, but with $m=\MChannels$
+channels \cref{eq:fwer} gives \PredFPRZFour{}. The Bonferroni correction \cite{dunn1961multiple}
+chooses a per-channel level of $\alpha/m$ to bound the family-wise rate by $\alpha$, giving the
+threshold
+\begin{equation}
+  z^*(\alpha) = \Phi^{-1}\!\Big(1 - \frac{\alpha}{2m}\Big).
+  \label{eq:bonf}
+\end{equation}
+Bonferroni is conservative when channels are positively correlated, but it requires no
+estimate of the correlation structure. \Cref{sec:eval:fpr} shows that \cref{eq:fwer}
+predicts the measured false-positive rate of the monitor closely.
+
+\subsection{ROC analysis}
+For a scalar detection statistic, the receiver operating characteristic plots the true-positive
+rate against the false-positive rate as the threshold varies. The area under the curve (AUC)
+equals the probability that a randomly chosen positive scores higher than a randomly chosen
+negative. An AUC of 0.5 corresponds to chance. The evaluation reports ROC curves for the
+maximum $|z|$ statistic.

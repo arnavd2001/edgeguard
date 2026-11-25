@@ -505,3 +505,28 @@ class TestAttackChainDetection:
         )
         # Merkle must catch it even when activations are suppressed
         assert result.threat_type != LLMThreatType.CLEAN
+
+
+# ===========================================================================
+# Regression: two's-complement bit flips must wrap, not saturate
+# ===========================================================================
+
+class TestTwosComplementFlips:
+    def test_random_flip_bit7_wraps(self):
+        """Flipping bit 7 of -5 (0xFB) must give 123 (0x7B), never clip to -128."""
+        from edgeguard.attacks.bitflip import BitFlipAttack
+        w = {"l": np.full((4, 4), -5, dtype=np.int8)}
+        for seed in range(64):
+            out = BitFlipAttack(strategy="random", n_flips=1, seed=seed).attack(w).attacked_weights["l"]
+            changed = out[out != -5]
+            assert changed.size == 1
+            delta = int(np.uint8(np.int8(-5).view(np.uint8) ^ changed[0].view(np.uint8)))
+            assert bin(delta).count("1") == 1, "exactly one bit must differ"
+
+    def test_cold_boot_flips_are_single_bit(self):
+        from edgeguard.attacks.weight_extraction import WeightExtractionAttack
+        w = {"l": np.full((64, 64), -5, dtype=np.int8)}
+        ext = WeightExtractionAttack(attack_type="cold_boot", seed=1).extract(w).extracted_weights["l"]
+        diff = (w["l"].view(np.uint8) ^ ext.view(np.uint8))
+        popcount = np.unpackbits(diff[diff != 0].reshape(-1, 1), axis=1).sum(axis=1)
+        assert diff.any() and np.all(popcount == 1)

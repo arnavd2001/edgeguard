@@ -121,7 +121,8 @@ class BitFlipAttack:
         idx = tuple(int(self.rng.integers(0, s)) for s in w.shape)
         bit = int(self.rng.integers(0, 8))
         old_val = int(w[idx])
-        w[idx] = np.int8(int(w[idx]) ^ (1 << bit))
+        # XOR through the uint8 view so bit 7 (sign) does not overflow int8
+        w[idx] = (w[idx].view(np.uint8) ^ np.uint8(1 << bit)).view(np.int8)
         return {"layer": layer, "idx": idx, "bit": bit,
                 "old": old_val, "new": int(w[idx]), "strategy": "random"}
 

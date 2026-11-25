@@ -1,0 +1,180 @@
+\chapter{Threat Model}
+\label{ch:threat}
+
+A defence is only meaningful relative to an explicit statement of what the attacker can do and
+what the defender is trying to preserve. This chapter gives that statement for
+\textsc{EdgeGuard}. \Cref{sec:tm:system} describes the system and its trust boundaries,
+\cref{sec:tm:adversary} the adversary, \cref{sec:tm:attacks} the attack classes considered, and
+\cref{sec:tm:goals} the properties \textsc{EdgeGuard} aims to provide and those it does not.
+
+% ---------------------------------------------------------------------------
+\section{System model}
+\label{sec:tm:system}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  comp/.style={draw=eggray, rounded corners=2pt, align=center, font=\small, minimum height=0.9cm, inner sep=4pt},
+  trusted/.style={comp, draw=egblue, fill=eglight},
+  atk/.style={draw=egorange, fill=egorange!10, rounded corners=2pt, align=center, font=\scriptsize, inner sep=3pt},
+  arr/.style={-{Stealth}, eggray},
+  aarr/.style={-{Stealth}, egorange, thick, dashed}]
+\node[comp, minimum width=2.6cm] (vendor) at (0,0) {Model vendor\\(signs weights)};
+\node[comp, minimum width=2.6cm] (repo) at (4.2,0) {Distribution\\channel / repo};
+\node[comp, minimum width=3.2cm] (dram) at (4.2,-2.6) {DRAM\\weights $\{L_i\}$};
+\node[comp, minimum width=2.6cm] (npu) at (8.6,-2.6) {NPU (HTP)\\inference};
+\node[trusted, minimum width=3.4cm] (eg) at (8.6,-5.2) {\textsc{EdgeGuard} verifier\\+ public key + calib.\ stats};
+\node[comp, minimum width=2.6cm] (user) at (0,-2.6) {Input source\\(user / network)};
+\node[comp, minimum width=2.6cm] (op) at (2.2,-5.2) {Operator /\\response policy};
+\draw[arr] (vendor) -- node[above, font=\scriptsize]{$\{L_i\}, r, \sigma$} (repo);
+\draw[arr] (repo) -- node[right, font=\scriptsize]{load} (dram);
+\draw[arr] (dram) -- node[above, font=\scriptsize]{DMA} (npu);
+\draw[arr] (user) -- node[above, font=\scriptsize]{prompts} (dram);
+\draw[arr] (npu) -- node[right, font=\scriptsize]{activations $\mathbf{a}_\ell$} (eg);
+\draw[arr] (dram.south east) -- node[above right, font=\scriptsize, pos=0.45]{re-hash} (eg.north west);
+\draw[arr] (eg) -- node[below, font=\scriptsize]{label + explanation} (op);
+\node[atk] (a1) at (2.1,1.2) {A4: supply-chain\\poisoning};
+\node[atk] (a2) at (1.6,-4.0) {A1: Rowhammer bit flips\\A2: cold boot / EM read};
+\node[atk] (a3) at (0,-1.1) {A3/A5: crafted\\prompts, probes};
+\draw[aarr] (a1) -- (repo);
+\draw[aarr] (a2) -- (dram);
+\draw[aarr] (a3) -- (user);
+\begin{scope}[on background layer]
+\node[draw=egblue, dashed, rounded corners=4pt, fit=(eg), inner sep=8pt, label={[font=\scriptsize, text=egblue]below:trusted (TEE / secure boot)}] {};
+\end{scope}
+\end{tikzpicture}
+\caption{System model and attack surfaces. Dashed orange arrows mark where each attack class
+acts. Only the \textsc{EdgeGuard} verifier, its public key and its calibration statistics are
+assumed trusted.}
+\label{fig:threat_model}
+\end{figure}
+
+\Cref{fig:threat_model} shows the deployment considered. A model vendor quantizes a model,
+computes the Merkle root $r$ over its weight tensors, signs it with a private key and
+distributes the weights with $(r,\sigma)$. On the device, the weights are loaded into DRAM and
+executed by the NPU. \textsc{EdgeGuard} runs alongside. It holds the vendor's public key and
+the calibration statistics, re-hashes the weights to check them against $r$, receives
+intermediate activations of each inference, and reports a label and explanation to an
+operator-defined response policy, such as reloading the weights, rejecting the input or
+alerting.
+
+\begin{assumption}[Trusted verifier]\label{as:trusted}
+The \textsc{EdgeGuard} verification code, the public key and the calibration statistics are
+protected from modification, for example by placing them in a TEE or covering them with
+secure boot. The attacker cannot change them.
+\end{assumption}
+
+\begin{assumption}[Honest signing]\label{as:honest}
+The weights signed by the vendor are the intended weights. A backdoor present at signing time is
+outside the scope of attestation (\cref{sec:tm:goals}).
+\end{assumption}
+
+\begin{assumption}[Clean calibration]\label{as:calib}
+The calibration inputs used to fit the activation monitor are free of attacks and representative
+of normal use.
+\end{assumption}
+
+\begin{assumption}[Activation access]\label{as:access}
+The runtime can expose per-layer activations of each monitored inference to the verifier, for
+example as additional graph outputs.
+\end{assumption}
+
+% ---------------------------------------------------------------------------
+\section{Adversary}
+\label{sec:tm:adversary}
+
+The adversary is assumed to have some or all of the following capabilities. Different attack
+classes use different subsets.
+
+\begin{description}[leftmargin=*,style=nextline]
+  \item[C1 — DRAM write primitive.] Unprivileged code co-located on the device can induce bit
+        flips in DRAM rows holding weights, via Rowhammer
+        \cite{kim2014flipping,yao2020deephammer}. The attacker can aim at particular bits, subject
+        to the physical constraints of the memory, and knows the model architecture and weights
+        (white-box), as BFA assumes \cite{rakin2019bfa}.
+  \item[C2 — DRAM read primitive.] With physical access, the attacker can read weights by a
+        cold-boot attack \cite{halderman2008lest} or estimate them through an electromagnetic
+        side channel, with some error.
+  \item[C3 — Input control.] The attacker can submit arbitrary inputs (prompts) and observe
+        outputs.
+  \item[C4 — Supply-chain access.] The attacker can modify weights between signing and loading,
+        for example on a mirror or in an update channel.
+\end{description}
+
+\noindent The adversary is assumed \emph{not} to be able to modify the verifier or its key
+(\cref{as:trusted}), forge ECDSA signatures, or find SHA-256 collisions or second preimages.
+
+\paragraph{Adaptivity.} A fully adaptive adversary knows the monitor's statistics and thresholds
+and optimises inputs to stay under them. The evaluation in this report does \emph{not} include
+such an adversary for the activation monitor. The synergy attack is a limited form of
+adaptivity: the attacker tries to suppress the activation signal while modifying weights.
+\Cref{sec:disc:adaptive} discusses what a fully adaptive attacker could do.
+
+% ---------------------------------------------------------------------------
+\section{Attack classes}
+\label{sec:tm:attacks}
+
+\Cref{tab:attack_classes} lists the six attack classes, the capability each requires, what it
+changes, and which \textsc{EdgeGuard} signal is expected to detect it.
+
+\begin{table}[t]
+\centering
+\caption{Attack classes considered, the capability they need, and the signal expected to reveal
+them.}
+\label{tab:attack_classes}
+\small
+\begin{tabularx}{\textwidth}{@{}lp{1.1cm}Xp{3.6cm}@{}}
+\toprule
+\textbf{Class} & \textbf{Needs} & \textbf{Changes} & \textbf{Expected signal} \\
+\midrule
+A1 Bit-flip attack & C1 & one or a few bits of stored weights & Merkle mismatch on the affected tensor(s) \\
+A2 Weight extraction & C2 & nothing on the device (read only) & none directly; see text \\
+A3 Training-data probe & C3 & nothing; inputs chosen to elicit memorised content & late-layer activation anomaly (hypothesised) \\
+A4 Supply-chain poisoning & C4 & weights before loading & Merkle mismatch, often many tensors \\
+A5 Adversarial input & C3 & nothing; crafted input & early/late activation anomaly \\
+A6 Synergy (A1 + A5) & C1, C3 & weights and input, input tuned to mask activations & Merkle mismatch despite weak activation signal \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Two classes need comment.
+
+\paragraph{A2 is not directly detectable.} Reading memory leaves no trace in the weights or in
+the activations of the device's own inferences. \textsc{EdgeGuard} cannot detect a cold-boot
+read, and no claim is made that it can. The extraction simulator is included because it
+quantifies how faithful a stolen copy would be (\cref{sec:eval:extraction}), and because a
+stolen copy enables A3 against the original deployment or offline.
+
+\paragraph{A3 detection rests on a hypothesis.} The extraction-probe simulator assumes that
+probes produce a distinctive activation signature: elevated and low-variance late-layer
+activations. If real memorisation probes do not produce such a signature, the monitor would not
+detect them. Validating the hypothesis on a real model is part of the plan in
+\cref{ch:conclusion}.
+
+% ---------------------------------------------------------------------------
+\section{Security goals and non-goals}
+\label{sec:tm:goals}
+
+\paragraph{Goals.}
+\begin{enumerate}[label=G\arabic*,leftmargin=*]
+  \item \textbf{Weight integrity.} If any byte of any attested tensor differs from the signed
+        version at verification time, verification fails. Under the standard assumptions on
+        SHA-256 and ECDSA, this holds with overwhelming probability.
+  \item \textbf{Localisation.} When verification fails, the set of tensors reported as modified
+        equals the set actually modified.
+  \item \textbf{Activation anomaly detection.} Inputs whose monitored activations are atypical
+        relative to calibration are flagged, at a false-positive rate the operator can choose.
+  \item \textbf{Actionable output.} Each detection carries a label from a fixed set and an
+        explanation naming the layers involved.
+\end{enumerate}
+
+\paragraph{Non-goals.}
+\begin{itemize}[leftmargin=*]
+  \item Detecting a backdoor present at signing time (\cref{as:honest}).
+  \item Detecting passive reads of memory (A2).
+  \item Preventing an attack, as opposed to detecting it. Recovery is left to the response policy.
+  \item Protection between verifications. If weights are verified at time $t_1$ and used at
+        $t_2>t_1$, a flip in between is missed until the next verification. This
+        time-of-check-to-time-of-use gap is analysed in \cref{sec:disc:toctou}.
+  \item Robustness of the activation monitor against a fully adaptive adversary.
+\end{itemize}

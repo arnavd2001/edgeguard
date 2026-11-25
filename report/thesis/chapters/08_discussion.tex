@@ -1,0 +1,195 @@
+\chapter{Discussion}
+\label{ch:discussion}
+
+The evaluation separated results that hold regardless of how activations were simulated from
+results that depend on it. This chapter examines what follows for deployment and for the next
+phase. \Cref{sec:disc:validity} discusses threats to validity. \Cref{sec:disc:adaptive}
+considers an adaptive attacker. \Cref{sec:disc:toctou,sec:disc:amortise} address the timing and
+cost of attestation. \Cref{sec:disc:llm} discusses what changes for real language models, and
+\cref{sec:disc:labels} the role of labels. \Cref{sec:disc:ethics} closes with ethical
+considerations.
+
+% ---------------------------------------------------------------------------
+\section{Threats to validity}
+\label{sec:disc:validity}
+
+\paragraph{Construct validity: simulated activations.} The largest threat is that activation-level
+attacks are defined as Gaussian distributions that differ from the clean Gaussian in mean or
+spread. The monitor models the clean Gaussian. Detection of such attacks is close to guaranteed
+whenever the difference is large, and impossible when it is small, so the measured rates reflect
+choices made in the simulator. Real activations are not Gaussian. Transformer activations in
+particular are known to contain large outliers in a few channels, the problem SmoothQuant
+addresses \cite{xiao2023smoothquant}. Such outliers would inflate the clean $z$ distribution and
+force higher thresholds, and per-channel normalisation would be essential.
+
+\paragraph{Internal validity: shared authorship.} The detector, the simulators and the evaluation
+were written together. The two defects of \cref{sec:impl:bugs} that sat in the simulators, and
+the covariance defect that sat in the detector, show that such a pipeline can hide errors.
+Independent references in the tests mitigate this risk, and the fact that the clean false-positive
+rate matches a closed-form prediction is reassuring, because a gross error in the scoring path
+would break that agreement.
+
+\paragraph{External validity: stub weights and the test machine.} The weight sets have
+realistic tensor shapes but random contents. Attestation cost depends only on byte count, so the
+scaling results transfer to real checkpoints of the same size. They do not transfer to the NPU
+or to a phone CPU, whose SHA-256 throughput may be higher, with hardware extensions, or lower.
+
+\paragraph{Statistical conclusion validity.} With \NPerScenario{} inputs per scenario, a measured
+rate of 100\% has a one-sided 95\% lower confidence bound of about 99.7\%, by the ``rule of
+three''. A measured rate of 0\% has an upper bound of about 0.3\%. These bounds are adequate for
+the claims made. The false-positive comparison (predicted \PredFPRZFour{}, measured \EmpFPRZFour{}
+with a seed-to-seed standard deviation of 1.5 points) is consistent within sampling error.
+
+% ---------------------------------------------------------------------------
+\section{An adaptive attacker}
+\label{sec:disc:adaptive}
+
+Suppose the attacker knows the calibration statistics and thresholds. The two detectors respond
+very differently.
+
+\paragraph{Against attestation,} knowledge does not help. Evading it requires a SHA-256 second
+preimage for a modified tensor, a forged ECDSA signature, or control of the verifier, and all
+three are excluded by the threat model. The realistic adaptive strategies are temporal rather than
+cryptographic: flip bits just after a verification and restore them before the next one, or
+attack between verifications (\cref{sec:disc:toctou}).
+
+\paragraph{Against the monitor,} knowledge helps a great deal. An attacker optimising an
+adversarial input can add a penalty that keeps every monitored channel's $|z|$ below $\tau_z$ and
+every Mahalanobis distance below $\tau_D$. Whether a successful attack remains feasible under that
+constraint depends on how much freedom the input space leaves once activations are confined to the
+calibration region. Carlini and Wagner showed that ten published adversarial-example detectors could
+each be bypassed by attacks constructed with knowledge of the detector
+\cite{carlini2017bypassing}. The honest default assumption is that a single-statistic monitor will not stop a determined adaptive
+attacker. Its realistic roles are to raise the cost of attacks, to catch non-adaptive ones such as
+off-the-shelf jailbreak prompts and faults, and to provide forensic signal.
+
+Three directions could make the monitor harder to evade, and each is a candidate for the next
+phase. First, keeping the set of monitored layers or channels secret and rotating it would force
+the attacker to satisfy constraints on everything. Second, statistics that are expensive to
+satisfy jointly, such as the joint distribution across layers, could replace per-layer marginals.
+Third, the monitor could be coupled to the model's output, so that inputs that change the output a
+great deal while keeping activations typical become suspicious.
+
+% ---------------------------------------------------------------------------
+\section{Time of check versus time of use}
+\label{sec:disc:toctou}
+
+Attestation certifies the weights at the moment they are hashed. If verification runs at times
+$t_1<t_2<\dots$ and inference reads weights at $t$, a flip at $t_1<t'<t$ affects that inference
+undetected, and it is caught only at the next verification. Two quantities therefore matter: the
+\emph{detection latency}, the time from a flip to the next verification that covers the modified
+tensor, and the \emph{exposure}, the number of inferences that run on modified weights in the
+meantime.
+
+Closing the gap completely would require verifying the bytes on the path into the accelerator,
+for example by hashing in the DMA engine or in on-chip SRAM after transfer. That is a hardware
+change. For a software-only design, the realistic goal is a bounded
+detection latency at an acceptable cost, the subject of the next section.
+
+% ---------------------------------------------------------------------------
+\section{Amortised attestation}
+\label{sec:disc:amortise}
+
+\Cref{sec:eval:merkle} measured \MerkVerLlamaPB{}\,ms to verify the 1.4\,GiB Llama-3.2-1B stub.
+Suppose a budget of $b$ seconds of hashing per inference step, and hashing throughput $\rho$
+bytes per second. Each step can verify $b\rho$ bytes. The Merkle tree makes partial verification
+sound: any subset of tensors can be checked against the signed root using their membership
+proofs (\cref{fig:merkle}), without hashing the rest.
+
+\paragraph{Round-robin verification.} Verify tensors in a fixed cyclic order, $b\rho$ bytes per
+step. A full cycle covering all $B$ bytes takes $\lceil B/(b\rho)\rceil$ steps, and every
+modification is detected within one cycle. At the measured $\rho\approx\MerkThrLlamaPB$\,MiB/s and a budget of
+$b=5$\,ms per token, $b\rho\approx 4.5$\,MiB per token, and the Llama-3.2-1B stub
+($B\approx\MerkSizeLlamaPB$\,MiB) is fully covered every $\approx315$ tokens. An attacker who
+knows the schedule can, however, time a flip-and-restore to avoid it.
+
+\paragraph{Randomised verification.} Choose each step's tensors at random, weighted by size, with
+the choice secret. A modified tensor of $\beta$ bytes is covered in a given step with probability
+about $q = \min(1, b\rho/B)$ if verification is byte-proportional, and it remains undetected
+after $t$ steps with probability $(1-q)^t$. With the numbers above, $q\approx 1/315$. A
+modification persisting for 1{,}000 tokens escapes detection with probability
+$(1-1/315)^{1000}\approx 4\%$, and one persisting for 2{,}000 tokens with probability about
+0.2\%. Randomisation removes the attacker's ability to predict the schedule at the cost of a
+probabilistic rather than deterministic bound. Combining the two, a random permutation per cycle,
+gives a deterministic bound of one cycle with unpredictable timing within it.
+
+\paragraph{Prioritised verification.} Not all tensors matter equally. Hong et al.\ found that a
+large fraction of single-bit vulnerabilities concentrate in particular parameters
+\cite{hong2019terminal}, HASHTAG selects layers by measured sensitivity
+\cite{javaheripi2021hashtag}, and NeuroPots steers attacks into known trapdoors
+\cite{liu2023neuropots}. Verifying sensitive tensors more often shortens their detection latency
+at no extra cost. For transformers, the embedding and output projections are a large share of
+the bytes ($2VH$ in \cref{eq:stub_params}, about 36\% of the Llama-3.2-1B stub's parameters). Their
+sensitivity to single flips relative to the attention and MLP projections is an open empirical
+question that the next phase can measure on a real model.
+
+\paragraph{Faster hashing.} SHA-256 throughput on CPUs with SHA extensions is typically several
+times higher than the \MerkThrMin{}--\MerkThrMax{}\,MiB/s measured on this container. A non-cryptographic
+checksum as a first-line filter, with cryptographic verification only on a schedule, is the
+trade-off RADAR and HASHTAG make \cite{li2021radar,javaheripi2021hashtag}. Such a filter must be
+keyed, or its positions secret, because an attacker who knows an unkeyed checksum can flip
+compensating bits. A keyed MAC computed with a key held in the TEE retains cryptographic strength
+and is typically faster than a hash plus a signature check.
+
+% ---------------------------------------------------------------------------
+\section{From stubs to real language models}
+\label{sec:disc:llm}
+
+Moving the monitor to a real quantized LLM changes four things.
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Channel count.} A model with hidden size 2048 and 16 blocks, monitored at two
+        points per block, has $m\approx 65{,}000$ channels per token. \Cref{eq:bonf} gives
+        $z^*\approx 5.25$ for $\alpha=1\%$, compared with \ZBonf{} here. The correction remains
+        cheap to compute, but every attack signal must exceed a higher bar.
+  \item \textbf{Covariance.} A dense $2048\times2048$ covariance per monitoring point is 32\,MiB
+        in double precision. Diagonal statistics, low-rank-plus-diagonal models, or projection
+        onto a few principal components are the realistic options.
+  \item \textbf{Tokens.} A language model produces one activation vector per token. Monitoring
+        can score each token, which is expensive and multiplies the comparisons, or summarise a
+        sequence. Prompt-level attacks are naturally scored per sequence, generation-time
+        extraction per token.
+  \item \textbf{Validating the memorisation hypothesis.} The extraction-probe detector assumes
+        that regurgitating memorised text produces confident, low-variance late activations. A
+        direct test is possible with public tools. Take a small open model, a set of known
+        memorised sequences such as those identified by extraction studies, and matched
+        non-memorised controls, and compare late-layer activation statistics while the model
+        generates them. If no difference appears, the memorisation score should be dropped. If
+        one does, its thresholds can be fitted to data rather than to the simulator.
+\end{enumerate}
+
+% ---------------------------------------------------------------------------
+\section{On threat labels}
+\label{sec:disc:labels}
+
+The classifier's labels were useful in the evaluation mainly because they failed in informative
+ways. Steganographic poisoning and runtime bit flips cannot be told apart from the weights alone.
+Inputs that disturb every layer were called faults. And an entropy score invariant to shifts and
+scaling could not respond to the simulated jailbreak. Each failure pointed to missing evidence
+rather than to a tuning problem. Provenance requires evidence over time, the fault-versus-attack
+distinction requires a comparison that is not biased by layer counts, and jailbreak detection
+requires a score sensitive to the property of interest.
+
+A more robust design would make the label a function of explicitly listed evidence, such as
+``hash mismatch at load time'', ``hash mismatch first seen at runtime'', ``anomaly rate in early
+layers $>$ late layers'' and ``memorisation score above threshold''. The output would report the
+evidence alongside a suggested interpretation, rather than collapsing everything into one of eight
+names. The explanation strings already list most of this evidence. Promoting it to structured
+output would let operators write their own response policies.
+
+% ---------------------------------------------------------------------------
+\section{Ethical considerations}
+\label{sec:disc:ethics}
+
+The attack simulators in this project do not implement working attacks. The bit-flip simulators
+modify arrays in memory and contain no Rowhammer code. The extraction and probe simulators
+generate synthetic activation distributions and recover no data. Nothing in the repository
+lowers the barrier to attacking a real system beyond what the cited literature already
+describes. The defensive components are intended to be published openly so that others can
+evaluate and improve them.
+
+Two downstream concerns deserve mention. A monitor that inspects activations sees, indirectly,
+information about user inputs, so a deployment should not log activations or explanations
+containing them without the same care applied to the inputs themselves. And false positives have
+costs: a 7\% false-alarm rate that rejects legitimate requests would harm users. This is one
+reason the threshold analysis of \cref{sec:eval:fpr} matters beyond the evaluation.
